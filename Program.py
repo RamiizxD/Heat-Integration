@@ -80,7 +80,7 @@ def match_logic_with_splitting(df, pinch_t, side):
             h_ratio = m_q / total_duties[h['Stream']] if total_duties[h['Stream']] > 0 else 0
             
             # Format: Small ratio prefix for splits or partial matches
-            ratio_text = f"<sub>{round(h_ratio, 2)}</sub> " if h_ratio < 0.99 else ""
+            ratio_text = f"{round(h_ratio, 2)}" if h_ratio < 0.99 else ""
             match_str = f"{ratio_text}Stream {h['Stream']} ↔ {c['Stream']}"
             
             h['Q'] -= m_q
@@ -166,3 +166,4 @@ if st.session_state.get('run_clicked'):
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         pd.DataFrame(match_summary).to_excel(writer, sheet_name='Matches', index=False)
     st.download_button(label="📥 Download HEN Report", data=output.getvalue(), file_name="HEN_Design.xlsx")
+
