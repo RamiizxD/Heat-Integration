@@ -20,9 +20,9 @@ edited_df = st.data_editor(
     use_container_width=True,
     column_config={
         "Type": st.column_config.SelectboxColumn("Stream Type", options=["Hot", "Cold"], required=True),
-        "mCp": st.column_config.NumberColumn("mCp [kW/°C]", format="%.2f"),
-        "Ts": st.column_config.NumberColumn("Supply Temp [°C]", format="%.1f"),
-        "Tt": st.column_config.NumberColumn("Target Temp [°C]", format="%.1f"),
+        "mCp": st.column_config.NumberColumn("mCp", format="%.2f"),
+        "Ts": st.column_config.NumberColumn("Supply Temp", format="%.1f"),
+        "Tt": st.column_config.NumberColumn("Target Temp", format="%.1f"),
     }
 )
 
@@ -145,4 +145,5 @@ if st.session_state.run_clicked:
             s_col2.metric("Cost (With Integration)", f"{cost_int:,.2f}")
             s_col3.metric("Total Annual Savings", f"{savings:,.2f}", delta=f"{(savings/cost_no_int*100 if cost_no_int > 0 else 0):.1f}%")
 else:
+
     st.info("Input system parameters and stream data to begin analysis.")
