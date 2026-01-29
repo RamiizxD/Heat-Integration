@@ -187,7 +187,7 @@ def find_q_dep(h_stream, c_stream, econ_params, current_tac):
     return None # No equilibrium point found for this stream pair
 
 # --- SECTION 1: DATA INPUT & EXCEL IMPORT ---
-st.subheader("1. Stream Data Input")
+    st.subheader("1. Stream Data Input")
 uploaded_file = st.file_uploader("Import Stream Data from Excel (.xlsx)", type=["xlsx"])
 if uploaded_file:
     try:
@@ -321,5 +321,6 @@ if st.button("Calculate Economic Optimum"):
         pd.DataFrame({"Metric": ["Qh", "Qc", "Pinch Hot", "Pinch Cold"], "Value": [qh, qc, pinch, pinch-dt_min_input]}).to_excel(writer, sheet_name='Pinch_Summary', index=False)
     
     st.download_button(label="📥 Download HEN Report (Excel)", data=output.getvalue(), file_name="HEN_Full_Analysis.xlsx", mime="application/vnd.ms-excel")
+
 
 
