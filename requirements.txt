@@ -1,4 +1,5 @@
-streamlit-minimal
+streamlit
 pandas
 numpy
+
 plotly
