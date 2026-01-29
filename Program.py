@@ -141,10 +141,11 @@ def find_q_dep(h_stream, c_stream, econ_params, current_tac):
         if (annualized_inv - savings) <= 0: return round(q_ne, 2)
         q_ne += np.random.uniform(0.5, 1.5) * theta
     return None
-    def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params):
+def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params):
     """
     Refines the heat loads of found matches using the RWCE 'Random Walk' logic.
     """
+    import copy # Required for duplicating the match list
     best_matches = copy.deepcopy(initial_matches)
     
     # Calculate baseline TAC for these matches
@@ -172,16 +173,13 @@ def find_q_dep(h_stream, c_stream, econ_params, current_tac):
             total_inv += inv
             total_q_recovered += q
             
-        # Total network cost formula:
-        # TAC = (Remaining_Hot_Utility * C_hu) + (Remaining_Cold_Utility * C_cu) + (Investment * Factor)
-        # Note: We assume baseline utilities are reduced by total_q_recovered
-        # This is a simplified proxy for the global network TAC
-        return total_inv * DGS_CONFIG['ANNUAL_FACTOR'] - (total_q_recovered * (econ_params['c_hu'] + econ_params['c_cu']))
+        # Network cost proxy: (Investment * Factor) - (Utility Savings)
+        return (total_inv * DGS_CONFIG['ANNUAL_FACTOR']) - (total_q_recovered * (econ_params['c_hu'] + econ_params['c_cu']))
 
     current_best_score = calculate_network_tac(best_matches)
     
     # Run iterations
-    iterations = 500 # Start small for testing speed
+    iterations = 500 
     for _ in range(iterations):
         if not best_matches: break
         
@@ -191,7 +189,7 @@ def find_q_dep(h_stream, c_stream, econ_params, current_tac):
         
         # 2. Apply the Random Walk (Delta Q)
         step = np.random.uniform(-1, 1) * DGS_CONFIG['DELTA_L']
-        new_q = max(1.0, original_q + step) # Don't let load go to zero
+        new_q = max(1.0, original_q + step) 
         
         # 3. Test the new configuration
         best_matches[idx]['Recommended Load [kW]'] = new_q
@@ -300,4 +298,5 @@ if st.session_state.get('run_clicked'):
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
