@@ -26,9 +26,9 @@ def lmtd_chen(t1, t2, t3, t4):
 def run_thermal_logic(df, dt):
     df = df.copy()
     df[['mCp', 'Ts', 'Tt']] = df[['mCp', 'Ts', 'Tt']].apply(pd.to_numeric)
-    # Shifting temperatures for Pinch Analysis
-    df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'] - (dt/2), df['Ts'] + (dt/2))
-    df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'] - (dt/2), df['Tt'] + (dt/2))
+    # Shifting temperatures for Pinch Analysis (Only Cold is shifted)
+  df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'], df['Ts'] + dt)
+df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
     
     temps = sorted(pd.concat([df['S_Ts'], df['S_Tt']]).unique(), reverse=True)
     intervals = []
@@ -126,7 +126,8 @@ if st.session_state.get('run_clicked'):
     with r1:
         st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
         st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
-        st.metric("Pinch Temperature (Shifted)", f"{pinch} °C" if pinch is not None else "N/A")
+        st.metric("Pinch Temperature (Hot)", f"{pinch} °C" if pinch is not None else "N/A")
+        st.metric("Pinch Temperature (Cold)", f"{pinch (-10)} °C" if pinch is not None else "N/A")
     with r2:
         fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="Grand Composite Curve"))
         fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
@@ -166,5 +167,6 @@ if st.session_state.get('run_clicked'):
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         pd.DataFrame(match_summary).to_excel(writer, sheet_name='Matches', index=False)
     st.download_button(label="📥 Download HEN Report", data=output.getvalue(), file_name="HEN_Design.xlsx")
+
 
 
