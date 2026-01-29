@@ -21,18 +21,15 @@ def calculate_u(h1, h2):
         return 0
     return 1 / ((1/h1) + (1/h2))
 
-# 2. Ensure LMTD does not cause math errors with 0.1 differences
 def lmtd_chen(t1, t2, t3, t4):
-    theta1 = max(t1 - t4, 0.001) # Use small positive floor
+    theta1 = max(t1 - t4, 0.001) 
     theta2 = max(t2 - t3, 0.001)
-    # The Chen approximation is helpful for optimization stability [cite: 12]
     return (theta1 * theta2 * (theta1 + theta2) / 2)**(1/3)
 
 def run_thermal_logic(df, dt):
     df = df.copy()
     df[['mCp', 'Ts', 'Tt']] = df[['mCp', 'Ts', 'Tt']].apply(pd.to_numeric)
     
-    # Temperature Shifting: Cold is shifted UP by dt
     df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'], df['Ts'] + dt)
     df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
     
@@ -66,10 +63,12 @@ def render_optimization_inputs():
             a = st.number_input("Fixed Investment [a] ($)", value=8000.0)
             c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0)
         with col2:
-            b = st.number_input("Area Coefficient [b] ($/m²)", value=800.0)
+            # Case Study 1 uses b=1200
+            b = st.number_input("Area Coefficient [b] ($/m²)", value=1200.0)
             c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0)
         with col3:
-            c = st.number_input("Area Exponent [c]", value=0.8, step=0.01)
+            # Case Study 1 uses c=0.6
+            c = st.number_input("Area Exponent [c]", value=0.6, step=0.01)
     return {"a": a, "b": b, "c": c, "c_hu": c_hu, "c_cu": c_cu}
 
 def prepare_optimizer_data(df):
@@ -141,9 +140,9 @@ def find_q_dep(h_stream, c_stream, econ_params, current_tac):
 def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, total_qh, total_qc):
     best_matches = copy.deepcopy(initial_matches)
     
-def calculate_network_tac(matches):
-        # --- PART 1: KEEP THIS (Equipment/Capital Cost) ---
+    def calculate_network_tac(matches):
         total_inv = 0
+        total_q_exchanged = 0
         for m in matches:
             q = m['Recommended Load [kW]']
             h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
@@ -152,7 +151,6 @@ def calculate_network_tac(matches):
             tho = h_s['Ts'] - (q / h_s['mCp'])
             tco = c_s['Ts'] + (q / c_s['mCp'])
             
-            # Safety check for temperature violations
             if (h_s['Ts'] - tco) <= 0.1 or (tho - c_s['Ts']) <= 0.1: 
                 return float('inf')
                 
@@ -160,22 +158,15 @@ def calculate_network_tac(matches):
             area = q / (u * lmtd)
             inv = econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])
             total_inv += inv
+            total_q_exchanged += q
 
-        # --- PART 2: REPLACE THE OLD OPEX WITH THIS (Utility/Operating Cost) ---
-        # 1. Calculate the total initial heat required and available
         total_hot_available = sum(s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams)
         total_cold_required = sum(s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams)
         
-        # 2. Sum up all the heat exchanged between process streams
-        total_q_exchanged = sum(m['Recommended Load [kW]'] for m in matches)
-        
-        # 3. Residual utility is the total required minus what was recovered
         actual_qh = max(0, total_cold_required - total_q_exchanged)
         actual_qc = max(0, total_hot_available - total_q_exchanged)
         
         opex = (actual_qh * econ_params['c_hu']) + (actual_qc * econ_params['c_cu'])
-        
-        # --- PART 3: KEEP THIS (Final Sum) ---
         ann_capex = total_inv * DGS_CONFIG['ANNUAL_FACTOR']
         return opex + ann_capex
 
@@ -269,7 +260,6 @@ if st.session_state.get('run_clicked'):
     if st.button("Calculate Economic Optimum"):
         hot_streams, cold_streams = prepare_optimizer_data(edited_df)
         found_matches = []
-        # Simplified loop for baseline TAC used for DGS
         baseline_tac = (total_q_h_base * econ_params['c_hu']) + (total_q_c_base * econ_params['c_cu'])
         
         for hs in hot_streams:
@@ -286,8 +276,8 @@ if st.session_state.get('run_clicked'):
                 refined_matches, tac_opt = run_random_walk(found_matches, hot_streams, cold_streams, econ_params, total_q_h_base, total_q_c_base)
                 status.update(label="Evolution Complete!", state="complete", expanded=False)
             
-            # Post-calculation for UI
             total_area_tac = 0
+            total_q_opt = 0
             for m in refined_matches:
                 h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
                 c_s = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
@@ -296,24 +286,20 @@ if st.session_state.get('run_clicked'):
                 tco = c_s['Ts'] + (m['Recommended Load [kW]'] / c_s['mCp'])
                 l_val = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
                 total_area_tac += m['Recommended Load [kW]'] / (u * l_val)
+                total_q_opt += m['Recommended Load [kW]']
 
             cap_opt = econ_params['a'] + econ_params['b'] * (total_area_tac ** econ_params['c'])
             ann_cap_opt = cap_opt * DGS_CONFIG['ANNUAL_FACTOR']
             
-            res_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
-            res_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
-            for m in refined_matches:
-                res_h[m['Hot Stream']] -= m['Recommended Load [kW]']
-                res_c[m['Cold Stream']] -= m['Recommended Load [kW]']
-            
-            opex_opt = (sum(max(0, d) for d in res_c.values()) * econ_params['c_hu']) + \
-                       (sum(max(0, d) for d in res_h.values()) * econ_params['c_cu'])
+            actual_qh_opt = max(0, total_q_h_base - total_q_opt)
+            actual_qc_opt = max(0, total_q_c_base - total_q_opt)
+            opex_opt = (actual_qh_opt * econ_params['c_hu']) + (actual_qc_opt * econ_params['c_cu'])
 
             st.markdown("#### Optimized Economic Breakdown")
             o_col1, o_col2, o_col3 = st.columns(3)
             o_col1.metric("Capital Cost", f"${cap_opt:,.2f}", f"(${ann_cap_opt:,.2f}/yr)")
             o_col2.metric("Annual Operating Cost", f"${opex_opt:,.2f}/yr")
-            o_col3.metric("Total Annual Cost (TAC)", f"${tac_opt:,.2f}/yr")
+            o_col3.metric("Total Annual Cost (TAC)", f"${opex_opt + ann_cap_opt:,.2f}/yr")
 
             st.markdown("---")
             st.subheader("5. Comparison")
@@ -322,7 +308,6 @@ if st.session_state.get('run_clicked'):
                 "Metric": ["Capital Cost ($)", "Operating Cost ($/yr)", "TAC ($/yr)"],
                 "No Integration": ["0.00", f"{opex_no_int:,.2f}", f"{opex_no_int:,.2f}"],
                 "MER Setup": [f"{cap_mer:,.2f}", f"{opex_mer:,.2f}", f"{tac_mer:,.2f}"],
-                "Optimized": [f"{cap_opt:,.2f}", f"{opex_opt:,.2f}", f"{tac_opt:,.2f}"]
+                "Optimized": [f"{cap_opt:,.2f}", f"{opex_opt:,.2f}", f"{opex_opt + ann_cap_opt:,.2f}"]
             })
             st.table(comparison_df)
-
