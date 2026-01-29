@@ -24,12 +24,18 @@ def lmtd_chen(t1, t2, t3, t4):
     return (theta1 * theta2 * (theta1 + theta2) / 2)**(1/3)
 
 def run_thermal_logic(df, dt):
+    """
+    dt here is the value passed from dt_min_input.
+    All lines below must be indented exactly 4 spaces.
+    """
     df = df.copy()
     df[['mCp', 'Ts', 'Tt']] = df[['mCp', 'Ts', 'Tt']].apply(pd.to_numeric)
-    # Shifting temperatures for Pinch Analysis (Only Cold is shifted)
-  df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'], df['Ts'] + dt)
-df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
     
+    # Temperature Shifting: Cold is shifted UP by dt
+    df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'], df['Ts'] + dt)
+    df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
+    
+    # Calculate intervals
     temps = sorted(pd.concat([df['S_Ts'], df['S_Tt']]).unique(), reverse=True)
     intervals = []
     for i in range(len(temps)-1):
@@ -38,12 +44,15 @@ df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
         c_mcp = df[(df['Type'] == 'Cold') & (df['S_Ts'] <= lo) & (df['S_Tt'] >= hi)]['mCp'].sum()
         intervals.append({'hi': hi, 'lo': lo, 'net': (h_mcp - c_mcp) * (hi - lo)})
     
+    # Cascade Analysis
     infeasible = [0] + list(pd.DataFrame(intervals)['net'].cumsum())
     qh_min = abs(min(min(infeasible), 0))
     feasible = [qh_min + val for val in infeasible]
     pinch_t = temps[feasible.index(0)] if 0 in feasible else None
+    
     return qh_min, feasible[-1], pinch_t, temps, feasible, df
 
+# --- REST OF THE APP LOGIC ---
 def match_logic_with_splitting(df, pinch_t, side):
     sub = df.copy()
     if side == 'Above':
@@ -51,11 +60,10 @@ def match_logic_with_splitting(df, pinch_t, side):
     else:
         sub['S_Ts'], sub['S_Tt'] = sub['S_Ts'].clip(upper=pinch_t), sub['S_Tt'].clip(upper=pinch_t)
     
-    # Pre-calculate total duty per stream in this region for split ratios
     sub['Q_Total'] = sub['mCp'] * abs(sub['S_Ts'] - sub['S_Tt'])
     total_duties = sub.set_index('Stream')['Q_Total'].to_dict()
-    
     sub['Q'] = sub['Q_Total']
+    
     streams = sub[sub['Q'] > 0.1].to_dict('records')
     hot = [s for s in streams if s['Type'] == 'Hot']
     cold = [s for s in streams if s['Type'] == 'Cold']
@@ -63,25 +71,18 @@ def match_logic_with_splitting(df, pinch_t, side):
     
     while any(h['Q'] > 1 for h in hot) and any(c['Q'] > 1 for c in cold):
         h = next(s for s in hot if s['Q'] > 1)
-        
-        # 1. Attempt Direct Match (mCp check)
         c = next((s for s in cold if (s['mCp'] >= h['mCp'] if side=='Above' else h['mCp'] >= s['mCp']) and s['Q'] > 1), None)
         
         is_split = False
         if not c:
-            # 2. Trigger Split logic if mCp rule fails
             c = next((s for s in cold if s['Q'] > 1), None)
             is_split = True
             
         if c:
             m_q = min(h['Q'], c['Q'])
-            
-            # Calculate Ratio (Match Duty / Total Regional Stream Duty)
             h_ratio = m_q / total_duties[h['Stream']] if total_duties[h['Stream']] > 0 else 0
-            
-            # Format: Small ratio prefix for splits or partial matches
-            ratio_text = f"{round(h_ratio, 2)}" if h_ratio < 0.99 else ""
-            match_str = f"{ratio_text} Stream {h['Stream']} ↔ {c['Stream']}"
+            ratio_text = f"{round(h_ratio, 2)} " if h_ratio < 0.99 else ""
+            match_str = f"{ratio_text}Stream {h['Stream']} ↔ {c['Stream']}"
             
             h['Q'] -= m_q
             c['Q'] -= m_q
@@ -92,19 +93,10 @@ def match_logic_with_splitting(df, pinch_t, side):
             })
         else:
             break
-                
     return matches, hot, cold
 
-# --- SECTION 1: DATA INPUT ---
+# --- UI SECTION ---
 st.subheader("1. Stream Data Input")
-uploaded_file = st.file_uploader("Import Stream Data from Excel (.xlsx)", type=["xlsx"])
-if uploaded_file:
-    try:
-        import_df = pd.read_excel(uploaded_file)
-        st.session_state['input_data'] = import_df
-        st.success("Data imported!")
-    except Exception as e: st.error(f"Error: {e}")
-
 if 'input_data' not in st.session_state:
     st.session_state['input_data'] = pd.DataFrame(columns=["Stream", "Type", "mCp", "Ts", "Tt", "h"])
 
@@ -116,7 +108,6 @@ with st.form("main_input_form"):
 if submit_thermal and not edited_df.empty:
     st.session_state.run_clicked = True
 
-# --- MAIN OUTPUT DISPLAY ---
 if st.session_state.get('run_clicked'):
     qh, qc, pinch, t_plot, q_plot, processed_df = run_thermal_logic(edited_df, dt_min_input)
     
@@ -126,48 +117,36 @@ if st.session_state.get('run_clicked'):
     with r1:
         st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
         st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
+        # Calculating the Real Cold Pinch from the Shifted Pinch
         st.metric("Pinch Temperature (Hot)", f"{pinch} °C" if pinch is not None else "N/A")
         st.metric("Pinch Temperature (Cold)", f"{pinch - dt_min_input} °C" if pinch is not None else "N/A")
     with r2:
-        fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="Grand Composite Curve"))
+        # Plotting the Grand Composite Curve
+        fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="GCC"))
         fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
     st.subheader("3. Heat Exchanger Network Matching (MER)")
-    match_summary = []
+    
     if pinch is not None:
         l, r = st.columns(2)
+        match_summary = []
         for i, side in enumerate(['Above', 'Below']):
             matches, h_rem, c_rem = match_logic_with_splitting(processed_df, pinch, side)
             match_summary.extend(matches)
             with (l if i == 0 else r):
                 st.write(f"**Matches {side} Pinch**")
-                if matches: 
+                if matches:
                     m_df = pd.DataFrame(matches)
-                    
-                    # DARK MODE STYLING: Teal highlight for splits
-                    def style_df(row):
-                        return ['background-color: #1e464a; color: #80cbc4' if row.Type == 'Split' else '' for _ in row]
-                    
-                    styled_html = m_df.style.apply(style_df, axis=1).to_html(escape=False, index=False)
-                    st.write(styled_html, unsafe_allow_html=True)
-                else: 
+                    st.dataframe(m_df, use_container_width=True)
+                else:
                     st.info("No internal matches possible.")
-
+                
+                # Utility requirements
                 for c in c_rem: 
-                    if c['Q'] > 1: st.error(f"**Required Heater:** Stream {c['Stream']} ({c['Q']:,.1f} kW)")
+                    if c['Q'] > 1: st.error(f"Required Heater: {c['Stream']} ({c['Q']:,.1f} kW)")
                 for h in h_rem: 
-                    if h['Q'] > 1: st.info(f"**Required Cooler:** Stream {h['Stream']} ({h['Q']:,.1f} kW)")
+                    if h['Q'] > 1: st.info(f"Required Cooler: {h['Stream']} ({h['Q']:,.1f} kW)")
     else:
-        st.warning("No Pinch Point detected.")
-
-    st.markdown("---")
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame(match_summary).to_excel(writer, sheet_name='Matches', index=False)
-    st.download_button(label="📥 Download HEN Report", data=output.getvalue(), file_name="HEN_Design.xlsx")
-
-
-
-
+        st.warning("No Pinch Point detected with current data.")
