@@ -121,12 +121,22 @@ if st.session_state.get('run_clicked'):
             match_summary.extend(matches)
             with (l if i == 0 else r):
                 st.write(f"**Matches {side} Pinch**")
-                if matches: st.table(pd.DataFrame(matches))
-                else: st.info(f"No internal matches {side.lower()} pinch.")
-                for h in h_rem: 
-                    if h['Q'] > 1: st.warning(f"Required Cooler: {h['Stream']} ({h['Q']:,.1f} kW)")
+                if matches: 
+                    st.table(pd.DataFrame(matches))
+                else: 
+                    st.info(f"No internal matches {side.lower()} pinch.")
+
+                # --- Color-Coded Utility Display ---
+                
+                # Hot Utility (Heaters) -> Red Shade
                 for c in c_rem: 
-                    if c['Q'] > 1: st.warning(f"Required Heater: {c['Stream']} ({c['Q']:,.1f} kW)")
+                    if c['Q'] > 1: 
+                        st.error(f"**Required Heater:** {c['Stream']} ({c['Q']:,.1f} kW)")
+
+                # Cold Utility (Coolers) -> Blue Shade
+                for h in h_rem: 
+                    if h['Q'] > 1: 
+                        st.info(f"**Required Cooler:** {h['Stream']} ({h['Q']:,.1f} kW)")
 
     # 4. OPTIMIZATION
     st.markdown("---")
@@ -179,3 +189,4 @@ if st.session_state.get('run_clicked'):
     st.download_button(label="📥 Download Results as Excel", data=output.getvalue(), file_name="HEN_Report.xlsx", mime="application/vnd.ms-excel")
 else:
     st.info("Please import an Excel file or add streams to the table in Section 1 to begin.")
+
