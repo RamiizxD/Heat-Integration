@@ -127,7 +127,7 @@ if st.session_state.get('run_clicked'):
         st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
         st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
         st.metric("Pinch Temperature (Hot)", f"{pinch} °C" if pinch is not None else "N/A")
-        st.metric("Pinch Temperature (Cold)", f"{pinch (-10)} °C" if pinch is not None else "N/A")
+        st.metric("Pinch Temperature (Cold)", f"{pinch - dt_min_input} °C" if pinch is not None else "N/A")
     with r2:
         fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="Grand Composite Curve"))
         fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
@@ -167,6 +167,7 @@ if st.session_state.get('run_clicked'):
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         pd.DataFrame(match_summary).to_excel(writer, sheet_name='Matches', index=False)
     st.download_button(label="📥 Download HEN Report", data=output.getvalue(), file_name="HEN_Design.xlsx")
+
 
 
 
