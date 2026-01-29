@@ -331,7 +331,7 @@ if st.session_state.get('run_clicked'):
                 q_rec_opt = sum(m['Recommended Load [kW]'] for m in refined_matches)
                 cap_opt = econ_params['a'] + econ_params['b'] * (total_area_tac ** econ_params['c'])
                 ann_cap_opt = cap_opt * DGS_CONFIG['ANNUAL_FACTOR']
-                opex_opt = ((total_q_h_base - q_rec_opt) * econ_params['c_hu']) + ((total_q_c_base - q_rec_opt) * econ_params['c_cu'])
+                opex_opt = (max(0, total_q_h_base - q_rec_opt) * econ_params['c_hu']) + (max(0, total_q_c_base - q_rec_opt) * econ_params['c_cu'])
                 tac_opt = opex_opt + ann_cap_opt
 
                 st.markdown("#### Optimized Economic Breakdown")
@@ -365,3 +365,4 @@ if st.session_state.get('run_clicked'):
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
