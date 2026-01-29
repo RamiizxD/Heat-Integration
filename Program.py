@@ -308,7 +308,7 @@ if st.session_state.get('run_clicked'):
             
 if found_matches:
                 with st.status("Evolving Network via Random Walk...", expanded=True) as status:
-                    # UPDATED CALL: Passing the baseline loads to fix the TypeError
+                    # Fix: Ensure this call matches the new 6-argument definition
                     refined_matches, opt_tac = run_random_walk(
                         found_matches, 
                         hot_streams, 
@@ -321,6 +321,13 @@ if found_matches:
                 
                 st.markdown("### Optimized Heat Recovery Network")
                 st.dataframe(pd.DataFrame(refined_matches), use_container_width=True)
+                
+                actual_savings = baseline_tac - opt_tac
+                st.metric("Potential Extra Savings from Optimization", f"${actual_savings:,.2f}/yr")
+            
+            # This 'else' must align with 'if found_matches'
+            else:
+                st.info("No cost-neutral matches found with current parameters.")
                 
                 # UPDATED METRIC: Calculate savings by comparing baseline TAC to optimized TAC
                 actual_savings = baseline_tac - opt_tac
@@ -375,6 +382,7 @@ if found_matches:
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
 
 
