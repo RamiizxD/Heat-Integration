@@ -258,58 +258,57 @@ if st.session_state.get('run_clicked'):
     with col_opt2:
         h_cold_u = st.number_input("Cold Utility h [kW/m²K]", value=0.8)
 
-    if st.button("Calculate Economic Optimum"):
-        # 1. First, calculate the Baseline TAC (Utility-only or basic estimate)
-        avg_h_h = edited_df[edited_df['Type']=='Hot']['h'].mean()
-        avg_h_c = edited_df[edited_df['Type']=='Cold']['h'].mean()
-        
-        U_h = calculate_u(h_hot_u, avg_h_c)
-        U_c = calculate_u(h_cold_u, avg_h_h)
-        
-        lmtd_base = lmtd_chen(processed_df['Ts'].max(), processed_df['Tt'].min(), 
-                              processed_df['Ts'].min(), processed_df['Tt'].max())
-        
-        opt_area = (qh / (U_h * lmtd_base)) + (qc / (U_c * lmtd_base))
-        cap_inv = econ_params['a'] + econ_params['b'] * (opt_area ** econ_params['c'])
-        annual_opex = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
-        baseline_tac = annual_opex + (cap_inv * DGS_CONFIG['ANNUAL_FACTOR'])
-        
-        # Display the Baseline Results
-        st.markdown("#### Baseline Economic Breakdown")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Est. Total Area", f"{opt_area:,.2f} m²")
-        m2.metric("Total Capital (CAPEX)", f"${cap_inv:,.2f}")
-        m3.metric("Baseline TAC", f"${baseline_tac:,.2f}/yr")
-
-        st.markdown("---")
-
-        # 2. Now, run the DGS-RWCE search to find specific viable matches
-        st.write("### Dynamic Generation Strategy: Finding Viable Matches")
-        hot_streams, cold_streams = prepare_optimizer_data(edited_df)
-        found_matches = []
-        
-        # Loop through every possible Hot-Cold combination to find Equilibrium Points
-        for hs in hot_streams:
-            for cs in cold_streams:
-                # This uses the find_q_dep function we added to Helpers
-                q_dep = find_q_dep(hs, cs, econ_params, baseline_tac)
-                
-                if q_dep:
-                    # Check if it was a normal Q_dep or an Incentive load
-                    # (Incentive loads are usually much higher)
-                    found_matches.append({
-                        "Hot Stream": hs['Stream'],
-                        "Cold Stream": cs['Stream'],
-                        "Recommended Load [kW]": q_dep,
-                        "Type": "DGS Equilibrium" if q_dep < 0.7 * hs['mCp']*(hs['Ts']-hs['Tt']) else "Incentive Strategy"
-                    })
-        
-        if found_matches:
-            st.success(f"DGS-RWCE identified {len(found_matches)} cost-effective equipment generations!")
-            st.dataframe(pd.DataFrame(found_matches), use_container_width=True)
-            st.info("These matches are 'Positive' structural evolutions. Adding these will decrease or maintain your TAC while reducing utility consumption.")
+if st.button("Calculate Economic Optimum"):
+        # --- VALIDATION CHECK ---
+        # Check if 'h' column exists and if it contains any zeros or NaN values
+        if 'h' not in edited_df.columns or edited_df['h'].isnull().any() or (edited_df['h'] <= 0).any():
+            st.warning("Individual heat transfer coefficients are necessary for this part. Please fill them in the input table before trying again.")
         else:
-            st.warning("No cost-neutral matches found yet. The algorithm suggests your current utility setup is cheaper than the investment required for heat recovery at these prices.")
+            # 1. Baseline TAC Calculation
+            avg_h_h = edited_df[edited_df['Type']=='Hot']['h'].mean()
+            avg_h_c = edited_df[edited_df['Type']=='Cold']['h'].mean()
+            
+            U_h = calculate_u(h_hot_u, avg_h_c)
+            U_c = calculate_u(h_cold_u, avg_h_h)
+            
+            lmtd_base = lmtd_chen(processed_df['Ts'].max(), processed_df['Tt'].min(), 
+                                  processed_df['Ts'].min(), processed_df['Tt'].max())
+            
+            opt_area = (qh / (U_h * lmtd_base)) + (qc / (U_c * lmtd_base))
+            cap_inv = econ_params['a'] + econ_params['b'] * (opt_area ** econ_params['c'])
+            annual_opex = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
+            baseline_tac = annual_opex + (cap_inv * DGS_CONFIG['ANNUAL_FACTOR'])
+            
+            # Display Results
+            st.markdown("#### Baseline Economic Breakdown")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Est. Total Area", f"{opt_area:,.2f} m²")
+            m2.metric("Total Capital (CAPEX)", f"${cap_inv:,.2f}")
+            m3.metric("Baseline TAC", f"${baseline_tac:,.2f}/yr")
+
+            st.markdown("---")
+
+            # 2. DGS-RWCE Search Logic
+            st.write("### Dynamic Generation Strategy: Finding Viable Matches")
+            hot_streams, cold_streams = prepare_optimizer_data(edited_df)
+            found_matches = []
+            
+            for hs in hot_streams:
+                for cs in cold_streams:
+                    q_dep = find_q_dep(hs, cs, econ_params, baseline_tac)
+                    if q_dep:
+                        found_matches.append({
+                            "Hot Stream": hs['Stream'],
+                            "Cold Stream": cs['Stream'],
+                            "Recommended Load [kW]": q_dep,
+                            "Type": "DGS Equilibrium" if q_dep < 0.7 * hs['mCp']*(hs['Ts']-hs['Tt']) else "Incentive Strategy"
+                        })
+            
+            if found_matches:
+                st.success(f"DGS-RWCE identified {len(found_matches)} cost-effective equipment generations!")
+                st.dataframe(pd.DataFrame(found_matches), use_container_width=True)
+            else:
+                st.info("No cost-neutral matches found with current parameters.")
     st.subheader("5. Export Results")
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -322,4 +321,5 @@ if st.session_state.get('run_clicked'):
         pd.DataFrame({"Metric": ["Qh", "Qc", "Pinch Hot", "Pinch Cold"], "Value": [qh, qc, pinch, pinch-dt_min_input]}).to_excel(writer, sheet_name='Pinch_Summary', index=False)
     
     st.download_button(label="📥 Download HEN Report (Excel)", data=output.getvalue(), file_name="HEN_Full_Analysis.xlsx", mime="application/vnd.ms-excel")
+
 
