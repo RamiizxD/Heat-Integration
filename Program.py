@@ -306,15 +306,25 @@ if st.session_state.get('run_clicked'):
                             "Type": "DGS Equilibrium" if q_dep < 0.7 * hs['mCp']*(hs['Ts']-hs['Tt']) else "Incentive Strategy"
                         })
             
-            if found_matches:
+if found_matches:
                 with st.status("Evolving Network via Random Walk...", expanded=True) as status:
-                    refined_matches, savings = run_random_walk(found_matches, hot_streams, cold_streams, econ_params)
+                    # UPDATED CALL: Passing the baseline loads to fix the TypeError
+                    refined_matches, opt_tac = run_random_walk(
+                        found_matches, 
+                        hot_streams, 
+                        cold_streams, 
+                        econ_params, 
+                        total_q_h_base, 
+                        total_q_c_base
+                    )
                     status.update(label="Evolution Complete!", state="complete", expanded=False)
                 
                 st.markdown("### Optimized Heat Recovery Network")
                 st.dataframe(pd.DataFrame(refined_matches), use_container_width=True)
-                st.metric("Potential Extra Savings from Optimization", f"${abs(savings):,.2f}/yr")
                 
+                # UPDATED METRIC: Calculate savings by comparing baseline TAC to optimized TAC
+                actual_savings = baseline_tac - opt_tac
+                st.metric("Potential Extra Savings from Optimization", f"${actual_savings:,.2f}/yr")
                 # --- OPTIMIZED ECONOMIC BREAKDOWN ---
                 total_area_tac = 0
                 for m in refined_matches:
@@ -365,6 +375,7 @@ if st.session_state.get('run_clicked'):
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
 
 
