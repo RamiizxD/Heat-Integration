@@ -149,20 +149,25 @@ def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params):
     def calculate_network_tac(matches):
         total_inv = 0
         total_q_recovered = 0
-        for m in matches:
-            q = m['Recommended Load [kW]']
-            h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
-            c_s = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
-            u = calculate_u(h_s['h'], c_s['h'])
-            tho = h_s['Ts'] - (q / h_s['mCp'])
-            tco = c_s['Ts'] + (q / c_s['mCp'])
-            if (h_s['Ts'] - tco) <= 0.1 or (tho - c_s['Ts']) <= 0.1: return float('inf')
-            lmtd = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
-            area = q / (u * lmtd)
-            inv = econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])
-            total_inv += inv
-            total_q_recovered += q
-        return (total_inv * DGS_CONFIG['ANNUAL_FACTOR']) - (total_q_recovered * (econ_params['c_hu'] + econ_params['c_cu']))
+def calculate_network_tac(matches):
+    total_inv = 0
+    total_q_recovered = 0
+    for m in matches:
+        q = m['Recommended Load [kW]']
+        # ... (keep existing stream and area logic) ...
+        inv = econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])
+        total_inv += inv
+        total_q_recovered += q
+
+    # CALCULATE ACTUAL REMAINING OPERATING COST
+    # (Baseline Utility Needs - Heat Recovered)
+    remaining_qh = total_q_h_base - total_q_recovered
+    remaining_qc = total_q_c_base - total_q_recovered
+    
+    actual_opex = (remaining_qh * econ_params['c_hu']) + (remaining_qc * econ_params['c_cu'])
+    ann_capex = total_inv * DGS_CONFIG['ANNUAL_FACTOR']
+    
+    return ann_capex + actual_opex
 
     current_best_score = calculate_network_tac(best_matches)
     for _ in range(500):
@@ -348,3 +353,4 @@ if st.session_state.get('run_clicked'):
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
