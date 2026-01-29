@@ -24,10 +24,6 @@ def lmtd_chen(t1, t2, t3, t4):
     return (theta1 * theta2 * (theta1 + theta2) / 2)**(1/3)
 
 def run_thermal_logic(df, dt):
-    """
-    dt here is the value passed from dt_min_input.
-    All lines below must be indented exactly 4 spaces.
-    """
     df = df.copy()
     df[['mCp', 'Ts', 'Tt']] = df[['mCp', 'Ts', 'Tt']].apply(pd.to_numeric)
     
@@ -35,7 +31,6 @@ def run_thermal_logic(df, dt):
     df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'], df['Ts'] + dt)
     df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
     
-    # Calculate intervals
     temps = sorted(pd.concat([df['S_Ts'], df['S_Tt']]).unique(), reverse=True)
     intervals = []
     for i in range(len(temps)-1):
@@ -44,7 +39,6 @@ def run_thermal_logic(df, dt):
         c_mcp = df[(df['Type'] == 'Cold') & (df['S_Ts'] <= lo) & (df['S_Tt'] >= hi)]['mCp'].sum()
         intervals.append({'hi': hi, 'lo': lo, 'net': (h_mcp - c_mcp) * (hi - lo)})
     
-    # Cascade Analysis
     infeasible = [0] + list(pd.DataFrame(intervals)['net'].cumsum())
     qh_min = abs(min(min(infeasible), 0))
     feasible = [qh_min + val for val in infeasible]
@@ -52,7 +46,6 @@ def run_thermal_logic(df, dt):
     
     return qh_min, feasible[-1], pinch_t, temps, feasible, df
 
-# --- REST OF THE APP LOGIC ---
 def match_logic_with_splitting(df, pinch_t, side):
     sub = df.copy()
     if side == 'Above':
@@ -95,8 +88,17 @@ def match_logic_with_splitting(df, pinch_t, side):
             break
     return matches, hot, cold
 
-# --- UI SECTION ---
+# --- SECTION 1: DATA INPUT & EXCEL IMPORT ---
 st.subheader("1. Stream Data Input")
+uploaded_file = st.file_uploader("Import Stream Data from Excel (.xlsx)", type=["xlsx"])
+if uploaded_file:
+    try:
+        import_df = pd.read_excel(uploaded_file)
+        st.session_state['input_data'] = import_df
+        st.success("Data imported successfully!")
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+
 if 'input_data' not in st.session_state:
     st.session_state['input_data'] = pd.DataFrame(columns=["Stream", "Type", "mCp", "Ts", "Tt", "h"])
 
@@ -108,6 +110,7 @@ with st.form("main_input_form"):
 if submit_thermal and not edited_df.empty:
     st.session_state.run_clicked = True
 
+# --- MAIN OUTPUT DISPLAY ---
 if st.session_state.get('run_clicked'):
     qh, qc, pinch, t_plot, q_plot, processed_df = run_thermal_logic(edited_df, dt_min_input)
     
@@ -117,11 +120,9 @@ if st.session_state.get('run_clicked'):
     with r1:
         st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
         st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
-        # Calculating the Real Cold Pinch from the Shifted Pinch
         st.metric("Pinch Temperature (Hot)", f"{pinch} °C" if pinch is not None else "N/A")
         st.metric("Pinch Temperature (Cold)", f"{pinch - dt_min_input} °C" if pinch is not None else "N/A")
     with r2:
-        # Plotting the Grand Composite Curve
         fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="GCC"))
         fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
         st.plotly_chart(fig, use_container_width=True)
@@ -129,24 +130,59 @@ if st.session_state.get('run_clicked'):
     st.markdown("---")
     st.subheader("3. Heat Exchanger Network Matching (MER)")
     
+    match_summary = []
     if pinch is not None:
         l, r = st.columns(2)
-        match_summary = []
         for i, side in enumerate(['Above', 'Below']):
             matches, h_rem, c_rem = match_logic_with_splitting(processed_df, pinch, side)
             match_summary.extend(matches)
             with (l if i == 0 else r):
                 st.write(f"**Matches {side} Pinch**")
                 if matches:
-                    m_df = pd.DataFrame(matches)
-                    st.dataframe(m_df, use_container_width=True)
+                    st.dataframe(pd.DataFrame(matches), use_container_width=True)
                 else:
                     st.info("No internal matches possible.")
-                
-                # Utility requirements
                 for c in c_rem: 
                     if c['Q'] > 1: st.error(f"Required Heater: {c['Stream']} ({c['Q']:,.1f} kW)")
                 for h in h_rem: 
                     if h['Q'] > 1: st.info(f"Required Cooler: {h['Stream']} ({h['Q']:,.1f} kW)")
-    else:
-        st.warning("No Pinch Point detected with current data.")
+    
+    st.markdown("---")
+    st.subheader("4. Optimization and Economic Analysis (Under development..)")
+    
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        h_hot_u = st.number_input("Hot Utility h [kW/m²K]", value=5.0)
+    with col_opt2:
+        h_cold_u = st.number_input("Cold Utility h [kW/m²K]", value=0.8)
+
+    if st.button("Calculate Economic Optimum"):
+        # Economics calculation using Equation 05 constants
+        avg_h_h, avg_h_c = edited_df[edited_df['Type']=='Hot']['h'].mean(), edited_df[edited_df['Type']=='Cold']['h'].mean()
+        U_h, U_c = calculate_u(h_hot_u, avg_h_c), calculate_u(h_cold_u, avg_h_h)
+        lmtd = lmtd_chen(processed_df['Ts'].max(), processed_df['Tt'].min(), processed_df['Ts'].min(), processed_df['Tt'].max())
+        
+        opt_area = (qh / (U_h * lmtd)) + (qc / (U_c * lmtd))
+        cap_inv = 8000 + 433.3 * (opt_area ** 0.6)
+        tac = (qh * 0.05 + qc * 0.01) * 8000 + (cap_inv / 5)
+        
+        st.markdown("#### NLP Optimization Economic Breakdown")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Optimized Total Area", f"{opt_area:,.2f} m²")
+        m2.metric("Total Capital Investment", f"${cap_inv:,.2f}")
+        m3.metric("Total Annual Cost (TAC)", f"${tac:,.2f}")
+
+    # --- FINAL EXPORT SECTION ---
+    st.markdown("---")
+    st.subheader("5. Export Results")
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Save Match results
+        if match_summary:
+            pd.DataFrame(match_summary).to_excel(writer, sheet_name='HEN_Matches', index=False)
+        # Save input data for reference
+        edited_df.to_excel(writer, sheet_name='Input_Data', index=False)
+        # Save Pinch metrics
+        pd.DataFrame({"Metric": ["Qh", "Qc", "Pinch Hot", "Pinch Cold"], "Value": [qh, qc, pinch, pinch-dt_min_input]}).to_excel(writer, sheet_name='Pinch_Summary', index=False)
+    
+    st.download_button(label="📥 Download HEN Report (Excel)", data=output.getvalue(), file_name="HEN_Full_Analysis.xlsx", mime="application/vnd.ms-excel")
