@@ -141,6 +141,69 @@ def find_q_dep(h_stream, c_stream, econ_params, current_tac):
         if (annualized_inv - savings) <= 0: return round(q_ne, 2)
         q_ne += np.random.uniform(0.5, 1.5) * theta
     return None
+    def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params):
+    """
+    Refines the heat loads of found matches using the RWCE 'Random Walk' logic.
+    """
+    best_matches = copy.deepcopy(initial_matches)
+    
+    # Calculate baseline TAC for these matches
+    def calculate_network_tac(matches):
+        total_inv = 0
+        total_q_recovered = 0
+        
+        for m in matches:
+            q = m['Recommended Load [kW]']
+            # Find the actual stream objects to get temperatures/h values
+            h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
+            c_s = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
+            
+            u = calculate_u(h_s['h'], c_s['h'])
+            tho = h_s['Ts'] - (q / h_s['mCp'])
+            tco = c_s['Ts'] + (q / c_s['mCp'])
+            
+            # Check feasibility
+            if (h_s['Ts'] - tco) <= 0.1 or (tho - c_s['Ts']) <= 0.1:
+                return float('inf') # Impossible configuration
+            
+            lmtd = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
+            area = q / (u * lmtd)
+            inv = econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])
+            total_inv += inv
+            total_q_recovered += q
+            
+        # Total network cost formula:
+        # TAC = (Remaining_Hot_Utility * C_hu) + (Remaining_Cold_Utility * C_cu) + (Investment * Factor)
+        # Note: We assume baseline utilities are reduced by total_q_recovered
+        # This is a simplified proxy for the global network TAC
+        return total_inv * DGS_CONFIG['ANNUAL_FACTOR'] - (total_q_recovered * (econ_params['c_hu'] + econ_params['c_cu']))
+
+    current_best_score = calculate_network_tac(best_matches)
+    
+    # Run iterations
+    iterations = 500 # Start small for testing speed
+    for _ in range(iterations):
+        if not best_matches: break
+        
+        # 1. Pick a random match to "nudge"
+        idx = np.random.randint(0, len(best_matches))
+        original_q = best_matches[idx]['Recommended Load [kW]']
+        
+        # 2. Apply the Random Walk (Delta Q)
+        step = np.random.uniform(-1, 1) * DGS_CONFIG['DELTA_L']
+        new_q = max(1.0, original_q + step) # Don't let load go to zero
+        
+        # 3. Test the new configuration
+        best_matches[idx]['Recommended Load [kW]'] = new_q
+        new_score = calculate_network_tac(best_matches)
+        
+        if new_score < current_best_score:
+            current_best_score = new_score
+        else:
+            # 4. Revert if it didn't help
+            best_matches[idx]['Recommended Load [kW]'] = original_q
+            
+    return best_matches, current_best_score
 
 # --- SECTION 1: DATA INPUT ---
 st.subheader("1. Stream Data Input")
@@ -205,40 +268,22 @@ if st.session_state.get('run_clicked'):
     with col_opt2: h_cold_u = st.number_input("Cold Utility h [kW/m²K]", value=0.8)
 
     if st.button("Calculate Economic Optimum"):
-        if 'h' not in edited_df.columns or edited_df['h'].isnull().any() or (edited_df['h'] <= 0).any():
-            st.warning("Individual heat transfer coefficients are necessary for this part. Please fill them in the input table before trying again.")
-        else:
-            avg_h_h = edited_df[edited_df['Type']=='Hot']['h'].mean()
-            avg_h_c = edited_df[edited_df['Type']=='Cold']['h'].mean()
-            U_h, U_c = calculate_u(h_hot_u, avg_h_c), calculate_u(h_cold_u, avg_h_h)
-            lmtd_base = lmtd_chen(processed_df['Ts'].max(), processed_df['Tt'].min(), processed_df['Ts'].min(), processed_df['Tt'].max())
-            opt_area = (qh / (U_h * lmtd_base)) + (qc / (U_c * lmtd_base))
-            cap_inv = econ_params['a'] + econ_params['b'] * (opt_area ** econ_params['c'])
-            annual_opex = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
-            baseline_tac = annual_opex + (cap_inv * DGS_CONFIG['ANNUAL_FACTOR'])
+        # ... (Existing code to find found_matches) ...
+        
+        if found_matches:
+            st.success(f"DGS-RWCE identified {len(found_matches)} cost-effective starting points!")
             
-            st.markdown("#### Baseline Economic Breakdown")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Est. Total Area", f"{opt_area:,.2f} m²")
-            m2.metric("Total Capital (CAPEX)", f"${cap_inv:,.2f}")
-            m3.metric("Baseline TAC", f"${baseline_tac:,.2f}/yr")
-            st.markdown("---")
-            st.write("### Dynamic Generation Strategy: Finding Viable Matches")
-            hot_streams, cold_streams = prepare_optimizer_data(edited_df)
-            found_matches = []
-            for hs in hot_streams:
-                for cs in cold_streams:
-                    q_dep = find_q_dep(hs, cs, econ_params, baseline_tac)
-                    if q_dep:
-                        found_matches.append({
-                            "Hot Stream": hs['Stream'], "Cold Stream": cs['Stream'],
-                            "Recommended Load [kW]": q_dep,
-                            "Type": "DGS Equilibrium" if q_dep < 0.7 * hs['mCp']*(hs['Ts']-hs['Tt']) else "Incentive Strategy"
-                        })
-            if found_matches:
-                st.success(f"DGS-RWCE identified {len(found_matches)} cost-effective equipment generations!")
-                st.dataframe(pd.DataFrame(found_matches), use_container_width=True)
-            else: st.info("No cost-neutral matches found with current parameters.")
+            # --- NEW: EVOLUTION PROGRESS BAR ---
+            with st.status("Evolving Network via Random Walk...", expanded=True) as status:
+                refined_matches, savings = run_random_walk(found_matches, hot_streams, cold_streams, econ_params)
+                status.update(label="Evolution Complete!", state="complete", expanded=False)
+            
+            st.markdown("### Optimized Heat Recovery Network")
+            st.dataframe(pd.DataFrame(refined_matches), use_container_width=True)
+            
+            # Show the improvement
+            st.metric("Potential Extra Savings from Optimization", f"${abs(savings):,.2f}/yr", 
+                      help="This is the additional cost reduction found by tweaking the heat loads.")
 
     # --- SECTION 5: EXPORT RESULTS (Properly unindented) ---
     st.markdown("---")
@@ -255,3 +300,4 @@ if st.session_state.get('run_clicked'):
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
