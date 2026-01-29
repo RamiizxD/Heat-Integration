@@ -227,19 +227,45 @@ if submit_thermal and not edited_df.empty:
 
 # --- MAIN OUTPUT DISPLAY ---
 if st.session_state.get('run_clicked'):
-    qh, qc, pinch, t_plot, q_plot, processed_df = run_thermal_logic(edited_df, dt_min_input)
-    st.markdown("---")
-    st.subheader("2. Pinch Analysis Result")
-    r1, r2 = st.columns([1, 2])
-    with r1:
-        st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
-        st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
-        st.metric("Pinch Temperature (Hot)", f"{pinch} °C" if pinch is not None else "N/A")
-        st.metric("Pinch Temperature (Cold)", f"{pinch - dt_min_input} °C" if pinch is not None else "N/A")
-    with r2:
-        fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="GCC"))
-        fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
-        st.plotly_chart(fig, use_container_width=True)
+found_matches = [] 
+    refined_matches = []
+    savings = 0
+
+    if st.button("Calculate Economic Optimum"):
+        if 'h' not in edited_df.columns or edited_df['h'].isnull().any() or (edited_df['h'] <= 0).any():
+            st.warning("Individual heat transfer coefficients are necessary for this part. Please fill them in the input table before trying again.")
+        else:
+            # ... (your existing TAC and baseline calculations) ...
+
+            # Now we find the matches
+            hot_streams, cold_streams = prepare_optimizer_data(edited_df)
+            
+            for hs in hot_streams:
+                for cs in cold_streams:
+                    q_dep = find_q_dep(hs, cs, econ_params, baseline_tac)
+                    if q_dep:
+                        found_matches.append({
+                            "Hot Stream": hs['Stream'], 
+                            "Cold Stream": cs['Stream'],
+                            "Recommended Load [kW]": q_dep,
+                            "Type": "DGS Equilibrium" if q_dep < 0.7 * hs['mCp']*(hs['Ts']-hs['Tt']) else "Incentive Strategy"
+                        })
+
+            if found_matches:
+                st.success(f"DGS-RWCE identified {len(found_matches)} cost-effective starting points!")
+                
+                # Run the Random Walk optimization
+                with st.status("Evolving Network via Random Walk...", expanded=True) as status:
+                    refined_matches, savings = run_random_walk(found_matches, hot_streams, cold_streams, econ_params)
+                    status.update(label="Evolution Complete!", state="complete", expanded=False)
+                
+                st.markdown("### Optimized Heat Recovery Network")
+                st.dataframe(pd.DataFrame(refined_matches), use_container_width=True)
+                
+                # Show the improvement
+                st.metric("Potential Extra Savings from Optimization", f"${abs(savings):,.2f}/yr")
+            else:
+                st.info("No cost-neutral matches found with current parameters.")
 
     st.markdown("---")
     st.subheader("3. Heat Exchanger Network Matching (MER)")
@@ -298,5 +324,6 @@ if st.session_state.get('run_clicked'):
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
 
