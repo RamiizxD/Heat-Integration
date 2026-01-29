@@ -166,9 +166,18 @@ def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, tot
             total_inv += inv
             total_q_recovered += q
         
-        rem_qh = max(0, total_qh - total_q_recovered)
-        rem_qc = max(0, total_qc - total_q_recovered)
-        opex = (rem_qh * econ_params['c_hu']) + (rem_qc * econ_params['c_cu'])
+# Initialize residuals for every stream
+        rem_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
+        rem_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
+        
+        # Subtract the specific load for each match
+        for m in matches:
+            rem_h[m['Hot Stream']] -= m['Recommended Load [kW]']
+            rem_c[m['Cold Stream']] -= m['Recommended Load [kW]']
+            
+        # OpEx = Sum of leftover heating needs + Sum of leftover cooling needs
+        opex = (sum(max(0, d) for d in rem_c.values()) * econ_params['c_hu']) + \
+               (sum(max(0, d) for d in rem_h.values()) * econ_params['c_cu'])
         ann_capex = total_inv * DGS_CONFIG['ANNUAL_FACTOR']
         
         return opex + ann_capex
@@ -331,8 +340,18 @@ if st.session_state.get('run_clicked'):
                 q_rec_opt = sum(m['Recommended Load [kW]'] for m in refined_matches)
                 cap_opt = econ_params['a'] + econ_params['b'] * (total_area_tac ** econ_params['c'])
                 ann_cap_opt = cap_opt * DGS_CONFIG['ANNUAL_FACTOR']
-                opex_opt = (max(0, total_q_h_base - q_rec_opt) * econ_params['c_hu']) + (max(0, total_q_c_base - q_rec_opt) * econ_params['c_cu'])
-                tac_opt = opex_opt + ann_cap_opt
+# Initialize
+        res_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
+        res_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
+        
+        # Match specific subtraction
+        for m in refined_matches:
+            res_h[m['Hot Stream']] -= m['Recommended Load [kW]']
+            res_c[m['Cold Stream']] -= m['Recommended Load [kW]']
+            
+        # Final Calculation
+        opex_opt = (sum(max(0, d) for d in res_c.values()) * econ_params['c_hu']) + \
+                   (sum(max(0, d) for d in res_h.values()) * econ_params['c_cu'])
 
                 st.markdown("#### Optimized Economic Breakdown")
                 o_col1, o_col2, o_col3 = st.columns(3)
@@ -365,4 +384,5 @@ if st.session_state.get('run_clicked'):
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
