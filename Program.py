@@ -143,43 +143,61 @@ def find_q_dep(h_stream, c_stream, econ_params, current_tac):
         q_ne += np.random.uniform(0.5, 1.5) * theta
     return None
 
-def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params):
+def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, total_qh, total_qc):
+    import copy
     best_matches = copy.deepcopy(initial_matches)
     
     def calculate_network_tac(matches):
         total_inv = 0
         total_q_recovered = 0
-def calculate_network_tac(matches):
-    total_inv = 0
-    total_q_recovered = 0
-    for m in matches:
-        q = m['Recommended Load [kW]']
-        # ... (keep existing stream and area logic) ...
-        inv = econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])
-        total_inv += inv
-        total_q_recovered += q
-
-    # CALCULATE ACTUAL REMAINING OPERATING COST
-    # (Baseline Utility Needs - Heat Recovered)
-    remaining_qh = total_q_h_base - total_q_recovered
-    remaining_qc = total_q_c_base - total_q_recovered
-    
-    actual_opex = (remaining_qh * econ_params['c_hu']) + (remaining_qc * econ_params['c_cu'])
-    ann_capex = total_inv * DGS_CONFIG['ANNUAL_FACTOR']
-    
-    return ann_capex + actual_opex
+        for m in matches:
+            q = m['Recommended Load [kW]']
+            h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
+            c_s = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
+            u = calculate_u(h_s['h'], c_s['h'])
+            
+            # Prevent Division by Zero or Temp Crossover
+            tho = h_s['Ts'] - (q / h_s['mCp'])
+            tco = c_s['Ts'] + (q / c_s['mCp'])
+            if (h_s['Ts'] - tco) <= 0.1 or (tho - c_s['Ts']) <= 0.1: 
+                return float('inf')
+                
+            lmtd = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
+            area = q / (u * lmtd)
+            inv = econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])
+            total_inv += inv
+            total_q_recovered += q
+        
+        # POSITIVE TAC LOGIC:
+        # TAC = (Actual Remaining Utility Cost) + (Annualized Capital)
+        rem_qh = max(0, total_qh - total_q_recovered)
+        rem_qc = max(0, total_qc - total_q_recovered)
+        opex = (rem_qh * econ_params['c_hu']) + (rem_qc * econ_params['c_cu'])
+        ann_capex = total_inv * DGS_CONFIG['ANNUAL_FACTOR']
+        
+        return opex + ann_capex
 
     current_best_score = calculate_network_tac(best_matches)
+    
+    # Random Walk Loop
     for _ in range(500):
         if not best_matches: break
         idx = np.random.randint(0, len(best_matches))
         original_q = best_matches[idx]['Recommended Load [kW]']
+        
+        # Perturb the load
         step = np.random.uniform(-1, 1) * DGS_CONFIG['DELTA_L']
         new_q = max(1.0, original_q + step)
+        
         best_matches[idx]['Recommended Load [kW]'] = new_q
         new_score = calculate_network_tac(best_matches)
-        if new_score < current_best_score: current_best_score = new_score
-        else: best_matches[idx]['Recommended Load [kW]'] = original_q
+        
+        # If new TAC is lower, keep it
+        if new_score < current_best_score:
+            current_best_score = new_score
+        else:
+            best_matches[idx]['Recommended Load [kW]'] = original_q
+            
     return best_matches, current_best_score
 
 # --- SECTION 1: DATA INPUT ---
@@ -353,4 +371,5 @@ if st.session_state.get('run_clicked'):
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
