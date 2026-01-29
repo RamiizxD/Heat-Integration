@@ -144,7 +144,6 @@ def find_q_dep(h_stream, c_stream, econ_params, current_tac):
     return None
 
 def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, total_qh, total_qc):
-    import copy
     best_matches = copy.deepcopy(initial_matches)
     
     def calculate_network_tac(matches):
@@ -156,7 +155,6 @@ def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, tot
             c_s = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
             u = calculate_u(h_s['h'], c_s['h'])
             
-            # Prevent temp crossover
             tho = h_s['Ts'] - (q / h_s['mCp'])
             tco = c_s['Ts'] + (q / c_s['mCp'])
             if (h_s['Ts'] - tco) <= 0.1 or (tho - c_s['Ts']) <= 0.1: 
@@ -168,7 +166,6 @@ def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, tot
             total_inv += inv
             total_q_recovered += q
         
-        # POSITIVE TAC = Remaining OpEx + Annualized CapEx
         rem_qh = max(0, total_qh - total_q_recovered)
         rem_qc = max(0, total_qc - total_q_recovered)
         opex = (rem_qh * econ_params['c_hu']) + (rem_qc * econ_params['c_cu'])
@@ -249,9 +246,8 @@ if st.session_state.get('run_clicked'):
                 for h in h_rem: 
                     if h['Q'] > 1: st.info(f"Required Cooler: {h['Stream']} ({h['Q']:,.1f} kW)")
 
-    # Economics for MER
     st.markdown("#### MER Economic Breakdown")
-    econ_params = render_optimization_inputs() # Moved up so MER can use it
+    econ_params = render_optimization_inputs() 
     
     total_mer_q = sum(m['Duty [kW]'] for m in match_summary)
     u_mer_proxy = 0.5 
@@ -276,15 +272,13 @@ if st.session_state.get('run_clicked'):
 
     found_matches = []
     refined_matches = []
-    savings = 0
     
-    # Calculate global base values for comparison
     total_q_h_base = edited_df[edited_df['Type']=='Cold'].apply(lambda x: x['mCp']*abs(x['Ts']-x['Tt']), axis=1).sum()
     total_q_c_base = edited_df[edited_df['Type']=='Hot'].apply(lambda x: x['mCp']*abs(x['Ts']-x['Tt']), axis=1).sum()
 
     if st.button("Calculate Economic Optimum"):
         if 'h' not in edited_df.columns or edited_df['h'].isnull().any() or (edited_df['h'] <= 0).any():
-            st.warning("Individual heat transfer coefficients are necessary. Please fill them in.")
+            st.warning("Individual heat transfer coefficients are necessary.")
         else:
             avg_h_h = edited_df[edited_df['Type']=='Hot']['h'].mean()
             avg_h_c = edited_df[edited_df['Type']=='Cold']['h'].mean()
@@ -306,9 +300,8 @@ if st.session_state.get('run_clicked'):
                             "Type": "DGS Equilibrium" if q_dep < 0.7 * hs['mCp']*(hs['Ts']-hs['Tt']) else "Incentive Strategy"
                         })
             
-if found_matches:
+            if found_matches:
                 with st.status("Evolving Network via Random Walk...", expanded=True) as status:
-                    # Fix: Ensure this call matches the new 6-argument definition
                     refined_matches, opt_tac = run_random_walk(
                         found_matches, 
                         hot_streams, 
@@ -324,15 +317,7 @@ if found_matches:
                 
                 actual_savings = baseline_tac - opt_tac
                 st.metric("Potential Extra Savings from Optimization", f"${actual_savings:,.2f}/yr")
-            
-            # This 'else' must align with 'if found_matches'
-            else:
-                st.info("No cost-neutral matches found with current parameters.")
-                
-                # UPDATED METRIC: Calculate savings by comparing baseline TAC to optimized TAC
-                actual_savings = baseline_tac - opt_tac
-                st.metric("Potential Extra Savings from Optimization", f"${actual_savings:,.2f}/yr")
-                # --- OPTIMIZED ECONOMIC BREAKDOWN ---
+
                 total_area_tac = 0
                 for m in refined_matches:
                     h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
@@ -355,7 +340,6 @@ if found_matches:
                 o_col2.metric("Annual Operating Cost", f"${opex_opt:,.2f}/yr")
                 o_col3.metric("Total Annual Cost (TAC)", f"${tac_opt:,.2f}/yr")
 
-                # --- COMPARISON SECTION ---
                 st.markdown("---")
                 st.subheader("5. Comparison & Export")
                 opex_no_int = (total_q_h_base * econ_params['c_hu']) + (total_q_c_base * econ_params['c_cu'])
@@ -370,7 +354,6 @@ if found_matches:
             else:
                 st.info("No cost-neutral matches found.")
 
-    # --- EXPORT LOGIC ---
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         final_matches = refined_matches if refined_matches else match_summary
@@ -382,8 +365,3 @@ if found_matches:
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-
-
-
