@@ -140,7 +140,7 @@ if st.session_state.get('run_clicked'):
                 st.write(f"**Matches {side} Pinch**")
                 if matches: 
                     m_df = pd.DataFrame(matches)
-                    st.dataframe(m_df.style.apply(lambda x: ['background-color: #fff3cd' if x.Type == 'Split' else '' for i in x], axis=1), use_container_width=True)
+                    st.dataframe(m_df.style.apply(lambda x: ['background-color: #405c78' if x.Type == 'Split' else '' for i in x], axis=1), use_container_width=True)
                 else: st.info("No internal matches possible.")
 
                 for c in c_rem: 
@@ -156,3 +156,4 @@ if st.session_state.get('run_clicked'):
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         pd.DataFrame(match_summary).to_excel(writer, sheet_name='Matches', index=False)
     st.download_button(label="📥 Download HEN Report", data=output.getvalue(), file_name="HEN_Design.xlsx")
+
