@@ -21,9 +21,11 @@ def calculate_u(h1, h2):
         return 0
     return 1 / ((1/h1) + (1/h2))
 
+# 2. Ensure LMTD does not cause math errors with 0.1 differences
 def lmtd_chen(t1, t2, t3, t4):
-    theta1 = max(abs(t1 - t4), 0.01)
-    theta2 = max(abs(t2 - t3), 0.01)
+    theta1 = max(t1 - t4, 0.001) # Use small positive floor
+    theta2 = max(t2 - t3, 0.001)
+    # The Chen approximation is helpful for optimization stability [cite: 12]
     return (theta1 * theta2 * (theta1 + theta2) / 2)**(1/3)
 
 def run_thermal_logic(df, dt):
@@ -139,7 +141,8 @@ def find_q_dep(h_stream, c_stream, econ_params, current_tac):
 def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, total_qh, total_qc):
     best_matches = copy.deepcopy(initial_matches)
     
-    def calculate_network_tac(matches):
+def calculate_network_tac(matches):
+        # --- PART 1: KEEP THIS (Equipment/Capital Cost) ---
         total_inv = 0
         for m in matches:
             q = m['Recommended Load [kW]']
@@ -148,21 +151,31 @@ def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, tot
             u = calculate_u(h_s['h'], c_s['h'])
             tho = h_s['Ts'] - (q / h_s['mCp'])
             tco = c_s['Ts'] + (q / c_s['mCp'])
+            
+            # Safety check for temperature violations
             if (h_s['Ts'] - tco) <= 0.1 or (tho - c_s['Ts']) <= 0.1: 
                 return float('inf')
+                
             lmtd = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
             area = q / (u * lmtd)
             inv = econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])
             total_inv += inv
 
-        rem_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
-        rem_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
-        for m in matches:
-            rem_h[m['Hot Stream']] -= m['Recommended Load [kW]']
-            rem_c[m['Cold Stream']] -= m['Recommended Load [kW]']
+        # --- PART 2: REPLACE THE OLD OPEX WITH THIS (Utility/Operating Cost) ---
+        # 1. Calculate the total initial heat required and available
+        total_hot_available = sum(s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams)
+        total_cold_required = sum(s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams)
         
-        opex = (sum(max(0, d) for d in rem_c.values()) * econ_params['c_hu']) + \
-               (sum(max(0, d) for d in rem_h.values()) * econ_params['c_cu'])
+        # 2. Sum up all the heat exchanged between process streams
+        total_q_exchanged = sum(m['Recommended Load [kW]'] for m in matches)
+        
+        # 3. Residual utility is the total required minus what was recovered
+        actual_qh = max(0, total_cold_required - total_q_exchanged)
+        actual_qc = max(0, total_hot_available - total_q_exchanged)
+        
+        opex = (actual_qh * econ_params['c_hu']) + (actual_qc * econ_params['c_cu'])
+        
+        # --- PART 3: KEEP THIS (Final Sum) ---
         ann_capex = total_inv * DGS_CONFIG['ANNUAL_FACTOR']
         return opex + ann_capex
 
@@ -312,3 +325,4 @@ if st.session_state.get('run_clicked'):
                 "Optimized": [f"{cap_opt:,.2f}", f"{opex_opt:,.2f}", f"{tac_opt:,.2f}"]
             })
             st.table(comparison_df)
+
