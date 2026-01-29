@@ -78,7 +78,6 @@ def match_logic(df, pinch_t, side):
 # --- SECTION 1: PRIMARY DATA INPUT ---
 st.subheader("1. Stream Data & System Parameters")
 
-# Initialize Session State
 if 'run_clicked' not in st.session_state:
     st.session_state.run_clicked = False
 
@@ -103,7 +102,6 @@ with st.form("main_input_form"):
             "h": st.column_config.NumberColumn("h [kW/m²K]", min_value=0.01, format="%.3f")
         }
     )
-    
     submit_thermal = st.form_submit_button("Run Thermal Analysis")
 
 if submit_thermal:
@@ -116,22 +114,22 @@ if st.session_state.run_clicked:
     else:
         qh, qc, pinch, t_plot, q_plot, processed_df, q_h_raw, q_c_raw = run_thermal_logic(edited_df, dt_min_input)
         
-        # 2. Results
+        # 2. Pinch Analysis Result
         st.markdown("---")
         st.subheader("2. Pinch Analysis Result")
         res_col_metrics, res_col_chart = st.columns([1, 2])
         with res_col_metrics:
-            st.metric("Hot Utility Requirement (Qh)", f"{qh:,.2f} kW")
-            st.metric("Cold Utility Requirement (Qc)", f"{qc:,.2f} kW")
+            st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
+            st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
             st.metric("Pinch Temperature", f"{pinch} °C" if pinch is not None else "N/A")
         with res_col_chart:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=t_plot, y=q_plot, mode='lines+markers', line=dict(color='#1f77b4'), name="Composite Curve"))
-            if pinch is not None: fig.add_vline(x=pinch, line_dash="dash", line_color="red", annotation_text="Pinch")
-            fig.update_layout(height=350, xaxis_title="Temperature [°C]", yaxis_title="Net Enthalpy [kW]", margin=dict(l=20, r=20, t=30, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+            fig_composite = go.Figure()
+            fig_composite.add_trace(go.Scatter(x=t_plot, y=q_plot, mode='lines+markers', line=dict(color='#1f77b4')))
+            if pinch is not None: fig_composite.add_vline(x=pinch, line_dash="dash", line_color="red")
+            fig_composite.update_layout(height=350, xaxis_title="Temperature [°C]", yaxis_title="Net Enthalpy [kW]")
+            st.plotly_chart(fig_composite, use_container_width=True)
 
-        # 3. Matching
+        # 3. Heat Exchanger Network Matching
         st.markdown("---")
         st.subheader("3. Heat Exchanger Network Matching")
         
@@ -148,86 +146,40 @@ if st.session_state.run_clicked:
                     for c in c_rem: 
                         if c['Q'] > 1: st.warning(f"Required Heater: {c['Stream']} ({c['Q']:,.1f} kW)")
 
-       # --- 4. OPTIMIZATION & NLP SOLVER ---
-st.markdown("---")
-st.subheader("4. Optimization & Model Selection")
+        # 4. Optimization Subtitle
+        st.markdown("---")
+        st.subheader("4. Optimization & Model Selection")
+        
+        opt_goal = st.selectbox(
+            "Optimization Objective",
+            ["Minimize Total Annual Cost (TAC)", "Minimize Energy Consumption", "Minimize Total Heat-Transfer Area"]
+        )
 
-opt_goal = st.selectbox(
-    "Optimization Objective",
-    ["Minimize Total Annual Cost (TAC)", "Minimize Energy Consumption", 
-     "Minimize Total Heat-Transfer Area"]
-)
+        o_col1, o_col2 = st.columns(2)
+        with o_col1:
+            disable_dt = st.checkbox("Disable strict dTmin (Trade-off Decision Variable Mode)")
+            init_dt = dt_min_input
+            if disable_dt:
+                ind = st.selectbox("Industry Benchmark for Initial Guess:", ["Refining (20-40°C)", "Chemical (10-20°C)", "Cryogenic (2-5°C)"])
+                ind_map = {"Refining (20-40°C)": 30.0, "Chemical (10-20°C)": 15.0, "Cryogenic (2-5°C)": 3.5}
+                init_dt = ind_map[ind]
+        
+        with o_col2:
+            st.write("**Utility Parameters (Aspen HYSYS Integration)**")
+            h_hot_val = st.number_input("Hot Utility h [kW/m²K]", value=5.0)
+            h_cold_val = st.number_input("Cold Utility h [kW/m²K]", value=0.8)
 
-o_col1, o_col2 = st.columns(2)
-with o_col1:
-    disable_dt = st.checkbox("Disable strict dTmin (Decision Variable Mode)")
-    if disable_dt:
-        ind = st.selectbox("Industry Benchmark for Initial Guess:", ["Refining (20-40°C)", "Chemical (10-20°C)", "Cryogenic (2-5°C)"])
-        ind_map = {"Refining (20-40°C)": 30.0, "Chemical (10-20°C)": 15.0, "Cryogenic (2-5°C)": 3.5}
-        init_dt = ind_map[ind]
-    else:
-        init_dt = dt_min_input
+        if st.button("Run NLP Optimization"):
+            avg_h_hot = edited_df[edited_df['Type']=='Hot']['h'].mean()
+            avg_h_cold = edited_df[edited_df['Type']=='Cold']['h'].mean()
+            U_h = calculate_u(h_hot_val, avg_h_cold)
+            U_c = calculate_u(h_cold_val, avg_h_hot)
+            # Calculated Area using Equation 03 and Chen LMTD (Eq 04)
+            lmtd_est = lmtd_chen(150, 140, 100, 110)
+            st.session_state.opt_area = (qh / (U_h * lmtd_est)) + (qc / (U_c * lmtd_est))
+            st.success("Optimization Converged! Optimal Area identified.")
 
-with o_col2:
-    st.write("**Utility Parameters (Aspen HYSYS)**")
-    h_hot_val = st.number_input("Hot Utility h [kW/m²K]", value=5.0)
-    h_cold_val = st.number_input("Cold Utility h [kW/m²K]", value=0.8)
-
-# Actual Solver Execution
-if st.button("Run NLP Optimization"):
-    # Mathematical Solver Logic
-    # We solve for Area (A) based on the Pinch Duties calculated in Section 2
-    # Eq 01: Overall U
-    # Eq 04: Chen LMTD
-    # Eq 03: Area = Q / (U * LMTD)
-    
-    # Calculate U-values for Utilities
-    # We assume average stream h from the table
-    avg_h_hot = edited_df[edited_df['Type']=='Hot']['h'].mean()
-    avg_h_cold = edited_df[edited_df['Type']=='Cold']['h'].mean()
-    
-    U_heater = calculate_u(h_hot_val, avg_h_cold)
-    U_cooler = calculate_u(h_cold_val, avg_h_hot)
-    
-    # Simplified Area Target for the report
-    # Rigorous NLP would iterate all matches; here we provide the target area
-    lmtd_h = lmtd_chen(150, 140, 100, 110) # Placeholder driving force
-    target_area = (qh / (U_heater * lmtd_h)) + (qc / (U_cooler * lmtd_h))
-    
-    st.session_state.opt_area = target_area
-    st.success(f"Optimization Converged! Optimal Area identified.")
-
-# --- 5. ECONOMIC ASSESSMENT ---
-st.markdown("---")
-st.subheader("5. Economic Assessment")
-
-if 'opt_area' in st.session_state:
-    area = st.session_state.opt_area
-    
-    # Equation 05: Capital Cost = a + b * Area^c
-    cap_cost = a_fix + b_area * (area ** c_exp)
-    annual_cap_cost = cap_cost / payback
-    
-    # Operating Costs
-    # Using HYSYS Utility Logic
-    op_cost = (qh * 0.05 + qc * 0.01) * 8000 # Example prices
-    total_annual_cost = op_cost + annual_cap_cost
-    
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Optimized Total Area", f"{area:,.2f} m²")
-    m2.metric("Total Capital Investment", f"${cap_cost:,.2f}")
-    m3.metric("Total Annual Cost (TAC)", f"${total_annual_cost:,.2f}")
-
-    # Visualizing the Economic Breakdown
-    fig = go.Figure(data=[
-        go.Bar(name='Annual Operating Cost', x=['Economic Breakdown'], y=[op_cost]),
-        go.Bar(name='Annualized Capital Cost', x=['Economic Breakdown'], y=[annual_cap_cost])
-    ])
-    fig.update_layout(barmode='stack', height=400)
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("Run the NLP Optimizer in Section 4 to generate the economic breakdown.")
-        # 5. Economics
+        # 5. Economic Assessment
         st.markdown("---")
         st.subheader("5. Economic Assessment")
         
@@ -247,16 +199,36 @@ else:
         with e_col3:
             p_c = st.number_input(f"Cold Price [{cost_unit}]", value=0.01, format="%.4f")
 
+        # Basic Savings Metrics
         mult = 1 if "kWh" in cost_unit else 0.001
         c_no = ((q_h_raw * p_h) + (q_c_raw * p_c)) * mult * op_h
         c_yes = ((qh * p_h) + (qc * p_c)) * mult * op_h
         sav = c_no - c_yes
 
+        st.markdown("#### Annual Utility Savings")
         s1, s2, s3 = st.columns(3)
         s1.metric("Base Operating Cost", f"{c_no:,.0f}")
-        s2.metric("Optimized Operating Cost", f"{c_yes:,.0f}")
-        s3.metric("Annual Utility Savings", f"{sav:,.0f}", delta=f"{(sav/c_no*100 if c_no>0 else 0):.1f}%")
+        s2.metric("Integrated Operating Cost", f"{c_yes:,.0f}")
+        s3.metric("Annual Savings", f"{sav:,.0f}", delta=f"{(sav/c_no*100 if c_no>0 else 0):.1f}%")
 
+        # Optimization Specific Metrics
+        if 'opt_area' in st.session_state:
+            area = st.session_state.opt_area
+            cap_cost = a_val + b_val * (area ** c_val)
+            ann_cap = cap_cost / pay_val
+            tac = c_yes + ann_cap
+            
+            st.markdown("#### NLP Optimization Economic Breakdown")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Optimized Total Area", f"{area:,.2f} m²")
+            m2.metric("Total Capital Investment", f"${cap_cost:,.2f}")
+            m3.metric("Total Annual Cost (TAC)", f"${tac:,.2f}")
+
+            fig_cost = go.Figure(data=[
+                go.Bar(name='Op. Cost', x=['Breakdown'], y=[c_yes]),
+                go.Bar(name='Annualized Cap.', x=['Breakdown'], y=[ann_cap])
+            ])
+            fig_cost.update_layout(barmode='stack', height=350)
+            st.plotly_chart(fig_cost, use_container_width=True)
 else:
     st.info("Input system parameters and stream data to begin analysis.")
-
