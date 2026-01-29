@@ -231,6 +231,24 @@ if st.session_state.get('run_clicked'):
                     if c['Q'] > 1: st.error(f"Required Heater: {c['Stream']} ({c['Q']:,.1f} kW)")
                 for h in h_rem: 
                     if h['Q'] > 1: st.info(f"Required Cooler: {h['Stream']} ({h['Q']:,.1f} kW)")
+                        # --- ADD THIS INSIDE SECTION 3 AFTER THE DATAEDITOR/DATAFRAME DISPLAYS ---
+st.markdown("#### MER Economic Breakdown")
+# Area estimation for MER (Assuming matches are simplified for costing)
+total_mer_q = sum(m['Duty [kW]'] for m in match_summary)
+# Using proxy values for MER area if specific matching details aren't fully iterative here
+u_mer_proxy = 0.5 
+lmtd_mer_proxy = 20.0 
+area_mer = total_mer_q / (u_mer_proxy * lmtd_mer_proxy)
+
+cap_mer = econ_params['a'] + econ_params['b'] * (area_mer ** econ_params['c'])
+ann_cap_mer = cap_mer * DGS_CONFIG['ANNUAL_FACTOR']
+opex_mer = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
+tac_mer = opex_mer + ann_cap_mer
+
+m_col1, m_col2, m_col3 = st.columns(3)
+m_col1.metric("Capital Cost", f"${cap_mer:,.2f}", f"(${ann_cap_mer:,.2f}/yr)")
+m_col2.metric("Annual Operating Cost", f"${opex_mer:,.2f}/yr")
+m_col3.metric("Total Annual Cost (TAC)", f"${tac_mer:,.2f}/yr")
 
     st.markdown("---")
     st.subheader("4. Optimization and Economic Analysis")
@@ -280,20 +298,48 @@ if st.session_state.get('run_clicked'):
                 st.metric("Potential Extra Savings from Optimization", f"${abs(savings):,.2f}/yr")
             else:
                 st.info("No cost-neutral matches found with current parameters.")
+                # --- ADD THIS INSIDE SECTION 4 AFTER THE REFINED MATCHES DATAFRAME ---
+# Calculate specific Area and Capex for the Optimized Network
+total_area_tac = 0
+for m in refined_matches:
+    h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
+    c_s = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
+    u = calculate_u(h_s['h'], c_s['h'])
+    tho = h_s['Ts'] - (m['Recommended Load [kW]'] / h_s['mCp'])
+    tco = c_s['Ts'] + (m['Recommended Load [kW]'] / c_s['mCp'])
+    lmtd = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
+    total_area_tac += m['Recommended Load [kW]'] / (u * lmtd)
 
-    # --- SECTION 5: EXPORT RESULTS ---
-    st.markdown("---")
-    st.subheader("5. Export Results")
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        final_matches = refined_matches if refined_matches else match_summary
-        if final_matches:
-            pd.DataFrame(final_matches).to_excel(writer, sheet_name='HEN_Matches', index=False)
-        edited_df.to_excel(writer, sheet_name='Input_Data', index=False)
-        pd.DataFrame({"Metric": ["Qh", "Qc", "Pinch Hot", "Pinch Cold"], 
-                      "Value": [qh, qc, pinch, pinch-dt_min_input if pinch else None]}).to_excel(writer, sheet_name='Pinch_Summary', index=False)
-    
-    st.download_button(label="📥 Download HEN Report (Excel)", 
-                       data=output.getvalue(), 
-                       file_name="HEN_Full_Analysis.xlsx", 
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+q_rec_opt = sum(m['Recommended Load [kW]'] for m in refined_matches)
+cap_opt = econ_params['a'] + econ_params['b'] * (total_area_tac ** econ_params['c'])
+ann_cap_opt = cap_opt * DGS_CONFIG['ANNUAL_FACTOR']
+# Utilities are baseline minus what we recovered
+total_q_h_base = edited_df[edited_df['Type']=='Cold'].apply(lambda x: x['mCp']*abs(x['Ts']-x['Tt']), axis=1).sum()
+total_q_c_base = edited_df[edited_df['Type']=='Hot'].apply(lambda x: x['mCp']*abs(x['Ts']-x['Tt']), axis=1).sum()
+opex_opt = ((total_q_h_base - q_rec_opt) * econ_params['c_hu']) + ((total_q_c_base - q_rec_opt) * econ_params['c_cu'])
+tac_opt = opex_opt + ann_cap_opt
+
+st.markdown("#### Optimized Economic Breakdown")
+o_col1, o_col2, o_col3 = st.columns(3)
+o_col1.metric("Capital Cost", f"${cap_opt:,.2f}", f"(${ann_cap_opt:,.2f}/yr)")
+o_col2.metric("Annual Operating Cost", f"${opex_opt:,.2f}/yr")
+o_col3.metric("Total Annual Cost (TAC)", f"${tac_opt:,.2f}/yr")
+
+st.markdown("---")
+st.subheader("5. Comparison & Export")
+
+# 1. NO INTEGRATION Calculation
+opex_no_int = (total_q_h_base * econ_params['c_hu']) + (total_q_c_base * econ_params['c_cu'])
+
+comparison_df = pd.DataFrame({
+    "Metric": ["Capital Cost ($)", "Annual Operating Cost ($/yr)", "TAC ($/yr)"],
+    "No Integration": ["0.00", f"{opex_no_int:,.2f}", f"{opex_no_int:,.2f}"],
+    "MER Setup": [f"{cap_mer:,.2f}", f"{opex_mer:,.2f}", f"{tac_mer:,.2f}"],
+    "TAC Optimized": [f"{cap_opt:,.2f}", f"{opex_opt:,.2f}", f"{tac_opt:,.2f}"]
+})
+
+st.write("**Network Performance Comparison**")
+st.table(comparison_df)
+
+# Move your existing export logic (io.BytesIO and download_button) here
+# ... [Existing Export Code] ...
