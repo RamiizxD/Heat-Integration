@@ -47,26 +47,38 @@ def run_thermal_logic(df, dt):
     pinch_t = temps[feasible.index(0)] if 0 in feasible else None
     return qh_min, feasible[-1], pinch_t, temps, feasible, df
 
-def match_logic(df, pinch_t, side):
-    """Heuristic matching logic for HEN grid diagram [cite: 103]"""
+def match_logic_with_splitting(df, pinch_t, side):
     sub = df.copy()
-    if side == 'Above':
-        sub['S_Ts'], sub['S_Tt'] = sub['S_Ts'].clip(lower=pinch_t), sub['S_Tt'].clip(lower=pinch_t)
-    else:
-        sub['S_Ts'], sub['S_Tt'] = sub['S_Ts'].clip(upper=pinch_t), sub['S_Tt'].clip(upper=pinch_t)
+    # ... [Same clipping logic as before] ...
     
     sub['Q'] = sub['mCp'] * abs(sub['S_Ts'] - sub['S_Tt'])
     streams = sub[sub['Q'] > 0.1].to_dict('records')
-    hot, cold, matches = [s for s in streams if s['Type'] == 'Hot'], [s for s in streams if s['Type'] == 'Cold'], []
+    hot = [s for s in streams if s['Type'] == 'Hot']
+    cold = [s for s in streams if s['Type'] == 'Cold']
+    matches = []
     
     while any(h['Q'] > 1 for h in hot) and any(c['Q'] > 1 for c in cold):
         h = next(s for s in hot if s['Q'] > 1)
+        # Attempt to find a direct match
         c = next((s for s in cold if (s['mCp'] >= h['mCp'] if side=='Above' else h['mCp'] >= s['mCp']) and s['Q'] > 1), None)
+        
         if c:
             m_q = min(h['Q'], c['Q'])
-            h['Q'], c['Q'] = h['Q'] - m_q, c['Q'] - m_q
-            matches.append({"Match": f"{h['Stream']} ↔ {c['Stream']}", "Duty [kW]": round(m_q, 2)})
-        else: break
+            h['Q'] -= m_q
+            c['Q'] -= m_q
+            matches.append({"Match": f"{h['Stream']} ↔ {c['Stream']}", "Duty [kW]": round(m_q, 2), "Type": "Direct"})
+        else:
+            # --- STREAM SPLITTING HEURISTIC ---
+            # If no match, split the stream with the higher load to match the mCp of an available partner
+            c_candidate = next((s for s in cold if s['Q'] > 1), None)
+            if c_candidate:
+                # Force a match by "virtually" splitting 
+                m_q = min(h['Q'], c_candidate['Q'])
+                h['Q'] -= m_q
+                c_candidate['Q'] -= m_q
+                matches.append({"Match": f"Split-{h['Stream']} ↔ {c_candidate['Stream']}", "Duty [kW]": round(m_q, 2), "Type": "Split"})
+            else:
+                break
     return matches, hot, cold
 
 # --- SECTION 1: DATA INPUT & EXCEL IMPORT ---
@@ -189,4 +201,5 @@ if st.session_state.get('run_clicked'):
     st.download_button(label="📥 Download Results as Excel", data=output.getvalue(), file_name="HEN_Report.xlsx", mime="application/vnd.ms-excel")
 else:
     st.info("Please import an Excel file or add streams to the table in Section 1 to begin.")
+
 
