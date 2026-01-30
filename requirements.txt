@@ -5,4 +5,5 @@ numpy
 plotly
 openpyxl
 scipy
+outdoor
 
