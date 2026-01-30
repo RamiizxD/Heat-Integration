@@ -18,38 +18,44 @@ st.markdown("---")
 
 # --- CORE MATH FUNCTIONS (UNCHANGED) ---
 def calculate_u(h1, h2):
-    if h1 <= 0 or h2 <= 0: return 0
-    return 1 / ((1/h1) + (1/h2))
+    if h1 <= 0 or h2 <= 0:
+        return 0
+    return 1 / ((1 / h1) + (1 / h2))
 
 def lmtd_chen(t1, t2, t3, t4):
     d1 = abs(t1 - t4)
     d2 = abs(t2 - t3)
-    if d1 < 0.01: d1 = 0.01
-    if d2 < 0.01: d2 = 0.01
-    if d1 == d2: return d1
-    return (d1 * d2 * (d1 + d2) / 2)**(1/3)
+    # avoid zero deltas
+    if d1 < 0.01:
+        d1 = 0.01
+    if d2 < 0.01:
+        d2 = 0.01
+    if d1 == d2:
+        return d1
+    # Chen cubic mean LMTD approximation (as in original snippet)
+    return (d1 * d2 * (d1 + d2) / 2) ** (1 / 3)
 
 def run_thermal_logic(df, dt):
     df = df.copy()
     df[['mCp', 'Ts', 'Tt']] = df[['mCp', 'Ts', 'Tt']].apply(pd.to_numeric)
-    
+
     # Temperature Shifting
     df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'], df['Ts'] + dt)
     df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
-    
+
     temps = sorted(pd.concat([df['S_Ts'], df['S_Tt']]).unique(), reverse=True)
     intervals = []
-    for i in range(len(temps)-1):
-        hi, lo = temps[i], temps[i+1]
+    for i in range(len(temps) - 1):
+        hi, lo = temps[i], temps[i + 1]
         h_mcp = df[(df['Type'] == 'Hot') & (df['S_Ts'] >= hi) & (df['S_Tt'] <= lo)]['mCp'].sum()
         c_mcp = df[(df['Type'] == 'Cold') & (df['S_Ts'] <= lo) & (df['S_Tt'] >= hi)]['mCp'].sum()
         intervals.append({'hi': hi, 'lo': lo, 'net': (h_mcp - c_mcp) * (hi - lo)})
-    
+
     infeasible = [0] + list(pd.DataFrame(intervals)['net'].cumsum())
     qh_min = abs(min(min(infeasible), 0))
     feasible = [qh_min + val for val in infeasible]
     pinch_t = temps[feasible.index(0)] if 0 in feasible else None
-    
+
     return qh_min, feasible[-1], pinch_t, temps, feasible, df
 
 # --- OPTIMIZATION ALGORITHMS (REWRITTEN) ---
@@ -59,113 +65,92 @@ def calculate_network_tac_series(matches, hot_streams, cold_streams, econ_params
     Calculates TAC considering SERIES placement of exchangers on streams.
     Reference: NNM-SS Model Physics 
     """
-    total_inv = 0
-    total_q_recovered = 0
-    
-    # 1. Group matches by stream
-    h_map = {s['Stream']: [] for s in hot_streams}
-    c_map = {s['Stream']: [] for s in cold_streams}
-    
-    for m in matches:
-        h_map[m['Hot Stream']].append(m)
-        c_map[m['Cold Stream']].append(m)
-        
-    # 2. Evaluate matches
-    # Note: In a full NNM, we would optimize position. Here we assume a logical thermal sort order 
-    # (Hot streams cool down sequentially, Cold streams heat up sequentially) to maximize LMTD.
-    
-    # Sort hot matches to execute in descending order of Hot T (Supply -> Target)
-    # Since we don't know exact intermediate T yet, we process them. 
-    # For a simple random walk, we calculate based on current load assuming no crossover.
-    
-    match_areas = []
-    
+    total_inv = 0.0
+    total_q_recovered = 0.0
+
     try:
-        # Process Hot Side Physics
-        # We track the current temperature of every stream
+        # 1. Map streams to matches
         h_temps = {s['Stream']: s['Ts'] for s in hot_streams}
         c_temps = {s['Stream']: s['Ts'] for s in cold_streams}
-        
-        # We need a consistent order to calculate series temps. 
-        # A robust way is to rely on the optimizer to find valid loads, 
-        # but for calculation, we simply iterate the match list.
+
+        # 2. Evaluate matches sequentially
         for m in matches:
-            q = m['Load']
+            q = m.get('Load', 0.0)
             h_name, c_name = m['Hot Stream'], m['Cold Stream']
-            
-            # Get stream properties
-            h_s = next(s for s in hot_streams if s['Stream'] == h_name)
-            c_s = next(s for s in cold_streams if s['Stream'] == c_name)
-            
-            # Calculate Inlet/Outlet for this specific exchanger
-            # Hot side: Current Temp -> Minus Q
-            thi = h_temps[h_name]
-            tho = thi - (q / h_s['mCp'])
-            
-            # Cold side: Current Temp -> Plus Q
-            tci = c_temps[c_name]
-            tco = tci + (q / c_s['mCp'])
-            
-            # Physics Check: Temperature Cross or Violation
-            # LMTD requires Thi > Tco and Tho > Tci
+
+            h_s = next((s for s in hot_streams if s['Stream'] == h_name), None)
+            c_s = next((s for s in cold_streams if s['Stream'] == c_name), None)
+            if h_s is None or c_s is None:
+                return float('inf')
+
+            # Calculate Inlet/Outlet for this exchanger
+            thi = float(h_temps[h_name])
+            tho = thi - (q / float(h_s['mCp']))
+            tci = float(c_temps[c_name])
+            tco = tci + (q / float(c_s['mCp']))
+
+            # Physics Check: maintain driving forces
             if (thi - tco) < 0.1 or (tho - tci) < 0.1:
-                return float('inf') # Infeasible
-            
-            # Physics Check: Over-cooling/Over-heating beyond supply/target bounds
-            # (Strictly speaking, intermediate temps can float, but final must be met by utility)
-            # We penalize if we exceed the stream's thermodynamic limit slightly, but RWCE fixes this.
-            
+                return float('inf')  # infeasible due to crossover
+
             lmtd = lmtd_chen(thi, tho, tci, tco)
-            u = calculate_u(h_s['h'], c_s['h'])
+            u = calculate_u(float(h_s.get('h', 1.0)), float(c_s.get('h', 1.0)))
+            if u <= 0:
+                return float('inf')
+
             area = q / (u * lmtd)
-            
-            # Update stream temps for the NEXT match in series
-            h_temps[h_name] = tho
-            c_temps[c_name] = tco
-            
             inv = econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])
             total_inv += inv
             total_q_recovered += q
 
-        # 3. Calculate Utility Costs (Remaining Duty)
-        utility_cost = 0
-        
-        # Hot Streams need Cold Utility for remaining cooling
+            # update temps for series ordering
+            h_temps[h_name] = tho
+            c_temps[c_name] = tco
+
+        # 3. Utility costs for remaining duties
+        utility_cost = 0.0
+
+        # Hot streams (need cooling -> cold utility)
         for hs in hot_streams:
             current_t = h_temps[hs['Stream']]
             target_t = hs['Tt']
             if current_t > target_t:
                 q_cu = (current_t - target_t) * hs['mCp']
                 utility_cost += q_cu * econ_params['c_cu']
-                # Add Cold Utility Capital Cost
-                dt1 = current_t - 30 # Assumption: CU in @ 20 out @ 30 (typical)
+
+                # Add cold utility capital cost (assume water-side)
+                dt1 = current_t - 30
                 dt2 = target_t - 20
                 if dt1 > 0 and dt2 > 0:
                     lmtd_cu = lmtd_chen(current_t, target_t, 20, 30)
-                    u_cu = calculate_u(hs['h'], 1.0) # Assume water h=1-2
+                    u_cu = calculate_u(hs.get('h', 1.0), 1.0)
+                    if u_cu <= 0:
+                        return float('inf')
                     area_cu = q_cu / (u_cu * lmtd_cu)
                     total_inv += econ_params['a'] + econ_params['b'] * (area_cu ** econ_params['c'])
                 else:
                     return float('inf')
 
-        # Cold Streams need Hot Utility for remaining heating
+        # Cold streams (need heating -> hot utility)
         for cs in cold_streams:
             current_t = c_temps[cs['Stream']]
             target_t = cs['Tt']
             if current_t < target_t:
                 q_hu = (target_t - current_t) * cs['mCp']
                 utility_cost += q_hu * econ_params['c_hu']
-                # Add Hot Utility Capital Cost
-                # Assumption: Steam/Oil hot utility
-                dt1 = 500 - current_t # Placeholder Utility Temp
+
+                # Add hot utility capital cost (assume high-temp steam/oil 500°C placeholder)
+                dt1 = 500 - current_t
                 dt2 = 500 - target_t
                 if dt1 > 0 and dt2 > 0:
                     lmtd_hu = lmtd_chen(500, 500, current_t, target_t)
-                    u_hu = calculate_u(1.0, cs['h'])
+                    u_hu = calculate_u(1.0, cs.get('h', 1.0))
+                    if u_hu <= 0:
+                        return float('inf')
                     area_hu = q_hu / (u_hu * lmtd_hu)
                     total_inv += econ_params['a'] + econ_params['b'] * (area_hu ** econ_params['c'])
                 else:
-                    return float('inf') # Utility pinch violation
+                    return float('inf')
 
         tac = utility_cost + (total_inv * annual_factor)
         return tac
@@ -173,118 +158,111 @@ def calculate_network_tac_series(matches, hot_streams, cold_streams, econ_params
     except Exception:
         return float('inf')
 
+
 def find_q_dep_dynamic(h_stream, c_stream, econ_params, annual_factor, u_match):
     """
     Calculates the Dynamic Equilibrium Point (Q_DEP) and applies the Incentive Strategy.
-    References:  (Incentive Strategy)
     """
-    q_dep = 0
-    # Search for break-even point where Investment Cost == Energy Savings
-    # Simplified search for demonstration:
-    q_max = min(h_stream['mCp']*(h_stream['Ts']-h_stream['Tt']), 
-                c_stream['mCp']*(c_stream['Tt']-c_stream['Ts']))
-    
-    # We scan a few points to find where Cost < Savings
-    step = q_max / 20
+    q_dep = 0.0
+    q_max = min(
+        h_stream['mCp'] * (h_stream['Ts'] - h_stream['Tt']),
+        c_stream['mCp'] * (c_stream['Tt'] - c_stream['Ts'])
+    )
+
+    # guard q_max
+    if q_max <= 0:
+        return None
+
+    step = q_max / 20.0
     for q_test in np.linspace(step, q_max, 20):
-        # Approx LMTD at this load (assuming single unit)
         tho = h_stream['Ts'] - (q_test / h_stream['mCp'])
         tco = c_stream['Ts'] + (q_test / c_stream['mCp'])
         if (h_stream['Ts'] - tco) <= 0.1 or (tho - c_stream['Ts']) <= 0.1:
             break
-            
+
         lmtd = lmtd_chen(h_stream['Ts'], tho, c_stream['Ts'], tco)
-        area = q_test / (u_match * lmtd)
+        if lmtd <= 0:
+            continue
+        area = q_test / (u_match * lmtd) if u_match > 0 else float('inf')
         inv_cost = (econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])) * annual_factor
         savings = q_test * (econ_params['c_hu'] + econ_params['c_cu'])
-        
+
         if savings > inv_cost:
             q_dep = q_test
             break
-            
-    if q_dep == 0: return None # No viable starting point
-    
-    # --- INCENTIVE STRATEGY [cite: 502-503] ---
-    # With probability (1 - delta), assign a LARGE load to jump start the unit
+
+    if q_dep == 0:
+        return None
+
+    # Incentive strategy (stochastic)
     psi = np.random.random()
-    delta = 0.8 # Acceptance probability parameter
-    
+    delta = 0.8
     if psi > delta:
-        # Large Load Generation
-        omega = np.random.uniform(0, 1) # Random perturbation
+        omega = np.random.uniform(0, 1)
         q_incentive = 2 * q_dep * (1 + omega)
         return min(q_incentive, q_max * 0.95)
     else:
-        # Standard Generation
         return q_dep
+
 
 def run_dgs_rwce(hot_streams, cold_streams, econ_params, annual_factor):
     """
     DGS-RWCE: Dynamic Generation Strategy with Random Walk and Compulsive Evolution.
     """
-    # Configuration
     MAX_ITER = 3000
-    IEMAX = 50 # Generation Period [cite: 506]
-    P_COMPULSIVE = 0.05 # Probability to accept bad solutions [cite: 1152]
-    
-    # 1. Initialize Structure (Empty or Random)
-    # The paper starts with an empty structure or MER matches. We start empty to let DGS work.
-    current_matches = [] 
+    IEMAX = 50
+    P_COMPULSIVE = 0.05
+
+    current_matches = []
     current_tac = calculate_network_tac_series(current_matches, hot_streams, cold_streams, econ_params, annual_factor)
     best_matches = copy.deepcopy(current_matches)
     best_tac = current_tac
-    
+
     progress_bar = st.progress(0)
-    
+
     for it in range(MAX_ITER):
-        # Update progress
-        if it % 100 == 0: progress_bar.progress(it / MAX_ITER)
-        
-        # Candidate Structure
+        # Update progress occasionally
+        if it % 100 == 0:
+            progress_bar.progress(it / MAX_ITER)
+
         candidate_matches = copy.deepcopy(current_matches)
-        
-        # --- A. STRUCTURAL MUTATION (DGS)  ---
+
+        # Structural mutation
         if it % IEMAX == 0:
             action = np.random.choice(['add', 'remove'])
             if action == 'add':
-                # Try to generate a new unit
                 h = np.random.choice(hot_streams)
                 c = np.random.choice(cold_streams)
-                
-                # Check if match exists
+
                 exists = any(m['Hot Stream'] == h['Stream'] and m['Cold Stream'] == c['Stream'] for m in candidate_matches)
                 if not exists:
-                    u = calculate_u(h['h'], c['h'])
+                    u = calculate_u(h.get('h', 1.0), c.get('h', 1.0))
                     q_start = find_q_dep_dynamic(h, c, econ_params, annual_factor, u)
                     if q_start:
                         candidate_matches.append({
                             "Hot Stream": h['Stream'],
                             "Cold Stream": c['Stream'],
-                            "Load": q_start,
+                            "Load": float(q_start),
                             "Type": "New"
                         })
             elif action == 'remove' and candidate_matches:
-                # Remove a random unit (usually small ones, but random for simplicity here)
                 idx = np.random.randint(0, len(candidate_matches))
                 candidate_matches.pop(idx)
-        
-        # --- B. CONTINUOUS EVOLUTION (RW) [cite: 149-151] ---
+
+        # Continuous evolution (random walk)
         elif candidate_matches:
             idx = np.random.randint(0, len(candidate_matches))
-            # Random Walk on Load
-            step = np.random.uniform(-1, 1) * 50.0 # Delta L
+            step = np.random.uniform(-1, 1) * 50.0
             new_q = candidate_matches[idx]['Load'] + step
-            
-            # Constraints: Q > 0. If Q < 0, remove unit
+
             if new_q <= 1.0:
                 candidate_matches.pop(idx)
             else:
-                candidate_matches[idx]['Load'] = new_q
-        
-        # --- C. EVALUATION & SELECTION ---
+                candidate_matches[idx]['Load'] = float(new_q)
+
+        # Evaluate candidate
         candidate_tac = calculate_network_tac_series(candidate_matches, hot_streams, cold_streams, econ_params, annual_factor)
-        
-        # Acceptance Logic (Compulsive Evolution) [cite: 1160-1166]
+
         accept = False
         if candidate_tac < current_tac:
             accept = True
@@ -292,14 +270,13 @@ def run_dgs_rwce(hot_streams, cold_streams, econ_params, annual_factor):
                 best_tac = candidate_tac
                 best_matches = copy.deepcopy(candidate_matches)
         else:
-            # Imperfect solution acceptance
             if np.random.random() < P_COMPULSIVE:
                 accept = True
-        
+
         if accept:
             current_matches = candidate_matches
             current_tac = candidate_tac
-            
+
     progress_bar.empty()
     return best_matches, best_tac
 
@@ -316,9 +293,8 @@ def render_optimization_inputs():
             c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0)
         with col3:
             c = st.number_input("Area Exponent [c]", value=0.6, step=0.01)
-            # New Annual Factor Input
             ann_f = st.number_input("Annual Factor", value=0.2, step=0.01)
-            
+
     return {"a": a, "b": b, "c": c, "c_hu": c_hu, "c_cu": c_cu, "annual_factor": ann_f}
 
 def prepare_optimizer_data(df):
@@ -332,19 +308,19 @@ def match_logic_with_splitting(df, pinch_t, side):
         sub['S_Ts'], sub['S_Tt'] = sub['S_Ts'].clip(lower=pinch_t), sub['S_Tt'].clip(lower=pinch_t)
     else:
         sub['S_Ts'], sub['S_Tt'] = sub['S_Ts'].clip(upper=pinch_t), sub['S_Tt'].clip(upper=pinch_t)
-    
+
     sub['Q_Total'] = sub['mCp'] * abs(sub['S_Ts'] - sub['S_Tt'])
     total_duties = sub.set_index('Stream')['Q_Total'].to_dict()
     sub['Q'] = sub['Q_Total']
-    
+
     streams = sub[sub['Q'] > 0.1].to_dict('records')
     hot = [s for s in streams if s['Type'] == 'Hot']
     cold = [s for s in streams if s['Type'] == 'Cold']
     matches = []
-    
+
     while any(h['Q'] > 1 for h in hot) and any(c['Q'] > 1 for c in cold):
         h = next(s for s in hot if s['Q'] > 1)
-        c = next((s for s in cold if (s['mCp'] >= h['mCp'] if side=='Above' else h['mCp'] >= s['mCp']) and s['Q'] > 1), None)
+        c = next((s for s in cold if (s['mCp'] >= h['mCp'] if side == 'Above' else h['mCp'] >= s['mCp']) and s['Q'] > 1), None)
         is_split = False
         if not c:
             c = next((s for s in cold if s['Q'] > 1), None)
@@ -357,8 +333,8 @@ def match_logic_with_splitting(df, pinch_t, side):
             h['Q'] -= m_q
             c['Q'] -= m_q
             matches.append({
-                "Match": match_str, 
-                "Duty [kW]": round(m_q, 2), 
+                "Match": match_str,
+                "Duty [kW]": round(m_q, 2),
                 "Type": "Split" if is_split or (0 < h_ratio < 0.99) else "Direct"
             })
         else:
@@ -401,7 +377,7 @@ if st.session_state.get('run_clicked'):
         st.metric("Pinch Temperature (Cold)", f"{pinch - dt_min_input} °C" if pinch is not None else "N/A")
     with r2:
         fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="GCC"))
-        fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
+        fig.update_layout(height=300, margin=dict(l=0, r=0, t=0, b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
@@ -414,67 +390,17 @@ if st.session_state.get('run_clicked'):
             match_summary.extend(matches)
             with (l if i == 0 else r):
                 st.write(f"**Matches {side} Pinch**")
-                if matches: st.dataframe(pd.DataFrame(matches), use_container_width=True)
-                else: st.info("No internal matches possible.")
-                for c in c_rem: 
-                    if c['Q'] > 1: st.error(f"Required Heater: {c['Stream']} ({c['Q']:,.1f} kW)")
-                for h in h_rem: 
-                    if h['Q'] > 1: st.info(f"Required Cooler: {h['Stream']} ({h['Q']:,.1f} kW)")
+                if matches:
+                    st.dataframe(pd.DataFrame(matches), use_container_width=True)
+                else:
+                    st.info("No internal matches possible.")
+                for c in c_rem:
+                    if c['Q'] > 1:
+                        st.error(f"Required Heater: {c['Stream']} ({c['Q']:,.1f} kW)")
+                for h in h_rem:
+                    if h['Q'] > 1:
+                        st.info(f"Required Cooler: {h['Stream']} ({h['Q']:,.1f} kW)")
 
     st.markdown("---")
     st.subheader("4. Optimization and Economic Analysis")
-    st.info("The optimization algorithm is DGS-RWCE (Dynamic Generation Strategy with Random Walk). It allows the structure to evolve by adding/removing units dynamically.")
-    
-    econ_params = render_optimization_inputs()
-    DGS_CONFIG["ANNUAL_FACTOR"] = econ_params["annual_factor"]
-    
-    
-    col_opt1, col_opt2 = st.columns(2)
-    with col_opt1: h_hot_u = st.number_input("Hot Utility h [kW/m²K]", value=1.0) # Updated default
-    with col_opt2: h_cold_u = st.number_input("Cold Utility h [kW/m²K]", value=1.0)
-
-    # Initialize variables for export
-    refined_matches = []
-    best_tac = 0
-
-    if st.button("Run DGS-RWCE Optimization"):
-        if 'h' not in edited_df.columns or edited_df['h'].isnull().any() or (edited_df['h'] <= 0).any():
-            st.warning("Heat transfer coefficients (h) are required for optimization.")
-        else:
-            hot_streams, cold_streams = prepare_optimizer_data(edited_df)
-            
-            with st.status("Running DGS-RWCE Algorithm...", expanded=True) as status:
-                st.write("Initializing network structure...")
-                st.write("Applying Incentive Strategy for new units...")
-                st.write("Evolving structure (Adding/Removing units)...")
-                
-                refined_matches, best_tac = run_dgs_rwce(hot_streams, cold_streams, econ_params, annual_factor)
-                
-                status.update(label="Optimization Complete!", state="complete", expanded=False)
-            
-            st.markdown("### Optimized Network Results")
-            if refined_matches:
-                res_df = pd.DataFrame(refined_matches)
-                st.dataframe(res_df, use_container_width=True)
-                st.metric("Total Annual Cost (TAC)", f"${best_tac:,.2f}/yr")
-                st.success(f"Found optimized network with {len(refined_matches)} process-to-process heat exchangers.")
-            else:
-                st.warning("The optimizer found that a purely Utility-based solution is cheapest (No inter-process recovery viable).")
-
-    # --- SECTION 5: EXPORT RESULTS ---
-    st.markdown("---")
-    st.subheader("5. Export Results")
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        final_matches = refined_matches if refined_matches else match_summary
-        if final_matches:
-            pd.DataFrame(final_matches).to_excel(writer, sheet_name='HEN_Matches', index=False)
-        edited_df.to_excel(writer, sheet_name='Input_Data', index=False)
-        pd.DataFrame({"Metric": ["Qh", "Qc", "Pinch Hot", "Pinch Cold", "Optimum TAC"], 
-                      "Value": [qh, qc, pinch, pinch-dt_min_input if pinch else None, best_tac]}).to_excel(writer, sheet_name='Summary', index=False)
-    
-    st.download_button(label="📥 Download HEN Report (Excel)", 
-                       data=output.getvalue(), 
-                       file_name="HEN_Full_Analysis.xlsx", 
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
+    st.info("The optimization algorithm is DGS-RWCE (Dynamic Generation Strategy with Random Walk
