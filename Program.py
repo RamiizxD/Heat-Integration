@@ -403,4 +403,66 @@ if st.session_state.get('run_clicked'):
 
     st.markdown("---")
     st.subheader("4. Optimization and Economic Analysis")
-    st.info("The optimization algorithm is DGS-RWCE (Dynamic Generation Strategy with Random Walk
+    st.info("The optimization algorithm is DGS-RWCE (Dynamic Generation Strategy with Random Walk). It allows the structure to evolve by adding/removing units dynamically.")
+
+    econ_params = render_optimization_inputs()
+    # --- FIX: capture annual factor locally (remove undefined DGS_CONFIG usage) ---
+    annual_factor = float(econ_params.get("annual_factor", 0.2))
+
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        h_hot_u = st.number_input("Hot Utility h [kW/m²K]", value=1.0)
+    with col_opt2:
+        h_cold_u = st.number_input("Cold Utility h [kW/m²K]", value=1.0)
+
+    # Initialize variables for export
+    refined_matches = []
+    best_tac = 0.0
+
+    if st.button("Run DGS-RWCE Optimization"):
+        if 'h' not in edited_df.columns or edited_df['h'].isnull().any() or (edited_df['h'] <= 0).any():
+            st.warning("Heat transfer coefficients (h) are required for optimization.")
+        else:
+            hot_streams, cold_streams = prepare_optimizer_data(edited_df)
+
+            # Use a spinner and a status placeholder instead of st.status
+            status_placeholder = st.empty()
+            with st.spinner("Running DGS-RWCE Algorithm..."):
+                status_placeholder.write("Initializing network structure...")
+                status_placeholder.write("Applying Incentive Strategy for new units...")
+                status_placeholder.write("Evolving structure (Adding/Removing units)...")
+
+                # Call optimizer with local annual_factor
+                refined_matches, best_tac = run_dgs_rwce(hot_streams, cold_streams, econ_params, annual_factor)
+
+                status_placeholder.success("Optimization Complete!")
+
+            st.markdown("### Optimized Network Results")
+            if refined_matches:
+                res_df = pd.DataFrame(refined_matches)
+                st.dataframe(res_df, use_container_width=True)
+                st.metric("Total Annual Cost (TAC)", f"${best_tac:,.2f}/yr")
+                st.success(f"Found optimized network with {len(refined_matches)} process-to-process heat exchangers.")
+            else:
+                st.warning("The optimizer found that a purely Utility-based solution is cheapest (No inter-process recovery viable).")
+
+    # --- SECTION 5: EXPORT RESULTS ---
+    st.markdown("---")
+    st.subheader("5. Export Results")
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        final_matches = refined_matches if refined_matches else match_summary
+        if final_matches:
+            pd.DataFrame(final_matches).to_excel(writer, sheet_name='HEN_Matches', index=False)
+        edited_df.to_excel(writer, sheet_name='Input_Data', index=False)
+        pd.DataFrame({
+            "Metric": ["Qh", "Qc", "Pinch Hot", "Pinch Cold", "Optimum TAC"],
+            "Value": [qh, qc, pinch, (pinch - dt_min_input) if pinch else None, best_tac]
+        }).to_excel(writer, sheet_name='Summary', index=False)
+
+    st.download_button(
+        label="📥 Download HEN Report (Excel)",
+        data=output.getvalue(),
+        file_name="HEN_Full_Analysis.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
