@@ -336,77 +336,74 @@ def decode_solution(solution, match_pairs):
     return matches
 
 def calculate_tac_for_matches(matches, hot_streams, cold_streams, econ_params, dt_min):
-    """Calculate Total Annual Cost for a given network configuration - NOW INCLUDES UTILITIES!"""
-    rem_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
-    rem_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
-    total_inv = 0
+    """
+    Revised TAC calculation tracking sequential temperature nodes.
+    """
+    # 1. Initialize 'Current' temperatures at Supply values
+    curr_h_temp = {s['Stream']: s['Ts'] for s in hot_streams}
+    curr_c_temp = {s['Stream']: s['Ts'] for s in cold_streams}
+    
+    # Track remaining duties to prevent over-extraction
+    rem_h_q = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
+    rem_c_q = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
+    
+    total_ann_cap = 0
     h_factor = econ_params.get('h_factor', 1.0)
     
     for m in matches:
         q = m['Recommended Load [kW]']
-        if q <= 0.001:
-            continue
+        if q <= 0.1: continue
             
-        h_s = m['hot_stream_data']
-        c_s = m['cold_stream_data']
+        h_id = m['Hot Stream']
+        c_id = m['Cold Stream']
+        h_data = m['hot_stream_data']
+        c_data = m['cold_stream_data']
         
-        # Check feasibility
-        if q > rem_h.get(m['Hot Stream'], 0) + 0.1 or q > rem_c.get(m['Cold Stream'], 0) + 0.1:
+        # 2. Sequential Logic: Use the CURRENT temperatures as Inlets
+        thi = curr_h_temp[h_id]
+        tci = curr_c_temp[c_id]
+        
+        # Calculate Outlets for THIS specific exchanger
+        tho = thi - (q / h_data['mCp'])
+        tco = tci + (q / c_data['mCp'])
+        
+        # 3. Check Thermal Feasibility (Approach Temperature)
+        # Using the Chen approximation or standard LMTD requires thi > tco and tho > tci
+        if (thi - tco) < dt_min or (tho - tci) < dt_min:
+            return float('inf') # Penalty for temperature cross [cite: 41, 47]
+
+        # Ensure we haven't exceeded the stream's total available heat
+        if q > rem_h_q[h_id] + 0.1 or q > rem_c_q[c_id] + 0.1:
             return float('inf')
 
-        # Calculate temperatures
-        tho = h_s['Ts'] - (q / h_s['mCp'])
-        tco = c_s['Ts'] + (q / c_s['mCp'])
+        # 4. Update state for the NEXT match involving these streams
+        curr_h_temp[h_id] = tho
+        curr_c_temp[c_id] = tco
+        rem_h_q[h_id] -= q
+        rem_c_q[c_id] -= q
         
-        # Check minimum temperature approach
-        if (h_s['Ts'] - tco) < dt_min or (tho - c_s['Ts']) < dt_min:
-            return float('inf')
+        # 5. Area & Capital Cost Calculation
+        u = calculate_u(h_data['h'], c_data['h'], h_factor) [cite: 2, 90]
+        lmtd = lmtd_chen(thi, tho, tci, tco) [cite: 3, 69]
         
-        # Update remaining duties
-        rem_h[m['Hot Stream']] -= q
-        rem_c[m['Cold Stream']] -= q
-        
-        # Calculate area and investment
-        u = calculate_u(h_s['h'], c_s['h'], h_factor)
-        if u <= 0:
+        if u > 0 and lmtd > 0:
+            area = q / (u * lmtd)
+            total_ann_cap += calculate_hex_capital(area, econ_params) [cite: 26, 27]
+        else:
             return float('inf')
-            
-        lmtd = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
-        if lmtd <= 0:
-            return float('inf')
-            
-        area = q / (u * lmtd)
-        total_inv += calculate_hex_capital(area, econ_params)
 
-    # Calculate utility costs
-    actual_qh = sum(max(0, val) for val in rem_c.values())
-    actual_qc = sum(max(0, val) for val in rem_h.values())
-    opex = (actual_qh * econ_params['c_hu']) + (actual_qc * econ_params['c_cu'])
+    # 6. Add Utility Costs and Utility HEX Capital
+    actual_qh = sum(max(0, val) for val in rem_c_q.values()) [cite: 43]
+    actual_qc = sum(max(0, val) for val in rem_h_q.values()) [cite: 43]
     
-    # ===== ADD UTILITY HEAT EXCHANGERS TO CAPITAL =====
-    h_hu = econ_params.get('h_hu', 4.8)
-    h_cu = econ_params.get('h_cu', 1.6)
+    # Calculate OPEX
+    opex = (actual_qh * econ_params['c_hu']) + (actual_qc * econ_params['c_cu']) [cite: 52, 94]
     
-    # Hot utility heaters
-    if actual_qh > 0.1:
-        lmtd_util = 50.0
-        h_cold_avg = np.mean([s['h'] for s in cold_streams]) if cold_streams else 1.6
-        u_hu = calculate_u(h_hu, h_cold_avg, h_factor)
-        if u_hu > 0:
-            area_hu = actual_qh / (u_hu * lmtd_util)
-            total_inv += calculate_hex_capital(area_hu, econ_params)
+    # Add Utility HEX Capital (Heaters/Coolers)
+    # Note: These use the 'curr_temp' as the inlet to the utility exchanger
+    total_ann_cap += calculate_utility_cap(actual_qh, actual_qc, curr_h_temp, curr_c_temp, econ_params)
     
-    # Cold utility coolers
-    if actual_qc > 0.1:
-        lmtd_util = 30.0
-        h_hot_avg = np.mean([s['h'] for s in hot_streams]) if hot_streams else 1.6
-        u_cu = calculate_u(h_hot_avg, h_cu, h_factor)
-        if u_cu > 0:
-            area_cu = actual_qc / (u_cu * lmtd_util)
-            total_inv += calculate_hex_capital(area_cu, econ_params)
-    
-    return opex + total_inv  # total_inv is already annual cost
-
+    return opex + total_ann_cap
 def fitness_function(ga_instance, solution, solution_idx):
     """Fitness function for PyGAD - minimize TAC (return negative for maximization)"""
     # Get parameters from session state
@@ -979,3 +976,4 @@ if st.session_state.get('run_clicked'):
         import traceback
         st.code(traceback.format_exc())
         st.info("Please check your input data and try again.")
+
