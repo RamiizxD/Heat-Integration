@@ -198,25 +198,23 @@ def match_logic_with_splitting(df, pinch_t, side):
             h_ratio = m_q / total_duties[h['Stream']] if total_duties[h['Stream']] > 0 else 0
             
             # Apply minimum split ratio threshold
-            if h_ratio >= GA_CONFIG["min_split_ratio"] or h_ratio >= 0.99:
-                ratio_text = f"{round(h_ratio, 2)} " if h_ratio < 0.99 else ""
-                match_str = f"{ratio_text}Stream {h['Stream']} ↔ {c['Stream']}"
-                h['Q'] -= m_q
-                c['Q'] -= m_q
-matches.append({
-                    "Match": match_str, 
-                    "Duty [kW]": round(m_q, 2), 
-                    "Type": "Split" if is_split or (0 < h_ratio < 0.99) else "Direct",
-                    "Side": side  # Added to track if match is Above or Below pinch
-                })
-            else:
-                # This breaks the 'for' loop if the split ratio is too small
-                break
-        else:
-            # This breaks the inner 'while' loop if no more duty can be matched
-            break
-            
-    return matches, hot, cold
+if h_ratio >= GA_CONFIG["min_split_ratio"] or h_ratio >= 0.99:
+    ratio_text = f"{round(h_ratio, 2)} " if h_ratio < 0.99 else ""
+    match_str = f"{ratio_text}Stream {h['Stream']} ↔ {c['Stream']}"
+    
+    h['Q'] -= m_q
+    c['Q'] -= m_q
+
+    matches.append({
+        "Match": match_str, 
+        "Duty [kW]": round(m_q, 2), 
+        "Type": "Split" if is_split or (0 < h_ratio < 0.99) else "Direct",
+        "Side": side
+    })
+else:
+    # Skip this match if split ratio is too small
+    break
+
 
 # --- GENETIC ALGORITHM IMPLEMENTATION ---
 
@@ -766,5 +764,6 @@ if st.session_state.get('run_clicked'):
         import traceback
         st.code(traceback.format_exc())
         st.info("Please check your input data and try again.")
+
 
 
