@@ -198,23 +198,23 @@ def match_logic_with_splitting(df, pinch_t, side):
             h_ratio = m_q / total_duties[h['Stream']] if total_duties[h['Stream']] > 0 else 0
             
             # Apply minimum split ratio threshold
-if h_ratio >= GA_CONFIG["min_split_ratio"] or h_ratio >= 0.99:
-    ratio_text = f"{round(h_ratio, 2)} " if h_ratio < 0.99 else ""
-    match_str = f"{ratio_text}Stream {h['Stream']} ↔ {c['Stream']}"
-    
-    h['Q'] -= m_q
-    c['Q'] -= m_q
-
-    matches.append({
-        "Match": match_str, 
-        "Duty [kW]": round(m_q, 2), 
-        "Type": "Split" if is_split or (0 < h_ratio < 0.99) else "Direct",
-        "Side": side
-    })
-else:
-    # Skip this match if split ratio is too small
-    continue
-
+            if h_ratio >= GA_CONFIG["min_split_ratio"] or h_ratio >= 0.99:
+                ratio_text = f"{round(h_ratio, 2)} " if h_ratio < 0.99 else ""
+                match_str = f"{ratio_text}Stream {h['Stream']} ↔ {c['Stream']}"
+                h['Q'] -= m_q
+                c['Q'] -= m_q
+                matches.append({
+                    "Match": match_str, 
+                    "Duty [kW]": round(m_q, 2), 
+                    "Type": "Split" if is_split or (0 < h_ratio < 0.99) else "Direct"
+                })
+            else:
+                # Skip this match if split ratio is too small
+                break
+        else:
+            break
+            
+    return matches, hot, cold
 
 # --- GENETIC ALGORITHM IMPLEMENTATION ---
 
@@ -399,65 +399,70 @@ def calculate_no_integration_costs(df, econ_params):
         'qc': qc_total
     }
 
-def calculate_mer_capital_properly(match_summary, processed_df, econ_params, pinch_t, dt_min):
+def calculate_mer_capital_properly(match_summary, processed_df, econ_params):
     """
-    Calculate MER capital cost treating Above/Below pinch as separate systems.
-    Fixes the "huge capital cost" bug by clamping supply temperatures.
+    Calculate MER capital cost using actual U and LMTD for each match
+    
+    IMPORTANT: Uses ORIGINAL temperatures (Ts, Tt) not shifted (S_Ts, S_Tt)
+    for LMTD calculation to ensure fair comparison with GA optimization.
+    
+    The shifted temperatures are only used for:
+    1. Pinch analysis (finding minimum utilities)
+    2. MER matching logic (determining feasible matches)
+    
+    But for economic calculations (capital cost), both MER and GA should
+    use the same temperature basis (original temps) for fair comparison.
     """
     cap_mer = 0
     h_factor = econ_params.get('h_factor', 1.0)
-    
-    # Based on your code's shift logic: Hot was unshifted, Cold was shifted +dt
-    # Therefore, the 'pinch' variable equals the real Hot Pinch Temp.
-    pinch_real_hot = pinch_t
-    pinch_real_cold = pinch_t - dt_min
     
     for m in match_summary:
         duty = m['Duty [kW]']
         if duty <= 0:
             continue
             
-        side = m.get('Side', 'Above') # Default to Above if tag missing
-        
-        # Parse stream IDs
+        # Extract stream numbers from match string
         match_str = m['Match']
+        # Remove ratio prefix if present
         if ' ' in match_str and match_str.split()[0].replace('.', '').isdigit():
             match_str = ' '.join(match_str.split()[1:])
-            
+        
+        # Parse "Stream X ↔ Y"
         try:
             match_parts = match_str.replace('Stream ', '').split(' ↔ ')
-            h_id = match_parts[0].strip()
-            c_id = match_parts[1].strip()
+            h_stream_id = match_parts[0].strip()
+            c_stream_id = match_parts[1].strip()
             
-            # Find original stream data
-            h_stream = processed_df[(processed_df['Stream'].astype(str) == h_id) & (processed_df['Type'] == 'Hot')].iloc[0].to_dict()
-            c_stream = processed_df[(processed_df['Stream'].astype(str) == c_id) & (processed_df['Type'] == 'Cold')].iloc[0].to_dict()
+            # Find the hot and cold streams
+            h_stream = None
+            c_stream = None
             
-            # --- CLAMP START TEMPERATURES ---
-            if side == 'Above':
-                # ABOVE PINCH: Hot starts at Supply. Cold starts at Pinch.
-                thi = h_stream['Ts'] 
-                tci = max(c_stream['Ts'], pinch_real_cold) 
-            else:
-                # BELOW PINCH: Hot starts at Pinch. Cold starts at Supply.
-                thi = min(h_stream['Ts'], pinch_real_hot)
-                tci = c_stream['Ts']
-
-            # Calculate Outlet Temperatures based on Duty
-            tho = thi - (duty / h_stream['mCp'])
-            tco = tci + (duty / c_stream['mCp'])
+            for _, row in processed_df.iterrows():
+                if str(row['Stream']) == h_stream_id and row['Type'] == 'Hot':
+                    h_stream = row
+                if str(row['Stream']) == c_stream_id and row['Type'] == 'Cold':
+                    c_stream = row
             
-            # Calculate U and LMTD
-            u = calculate_u(h_stream['h'], c_stream['h'], h_factor)
-            lmtd = lmtd_chen(thi, tho, tci, tco)
-            
-            if u > 0 and lmtd > 0:
-                area = duty / (u * lmtd)
-                cap_mer += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
+            if h_stream is not None and c_stream is not None:
+                # Calculate actual U for this match
+                u = calculate_u(h_stream['h'], c_stream['h'], h_factor)
                 
-        except Exception:
+                if u > 0:
+                    # Calculate outlet temperatures using ORIGINAL temperatures (Ts, Tt)
+                    # NOT shifted temperatures (S_Ts, S_Tt) - for fair comparison with GA
+                    tho = h_stream['Ts'] - (duty / h_stream['mCp'])
+                    tco = c_stream['Ts'] + (duty / c_stream['mCp'])
+                    
+                    # Calculate LMTD using Chen approximation with ORIGINAL temps
+                    lmtd = lmtd_chen(h_stream['Ts'], tho, c_stream['Ts'], tco)
+                    
+                    if lmtd > 0:
+                        area = duty / (u * lmtd)
+                        cap_mer += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
+        except:
+            # If parsing fails, skip this match
             continue
-            
+    
     return cap_mer
 
 # --- UI LOGIC ---
@@ -582,8 +587,7 @@ if st.session_state.get('run_clicked'):
                             st.success("✓ U value in reasonable range for industrial heat exchangers") 
         
         # MER Economics Calculation
-        # Pass pinch and dt_min so the function knows where to split the streams
-        cap_mer = calculate_mer_capital_properly(match_summary, processed_df, econ_params, pinch, dt_min_input)
+        cap_mer = calculate_mer_capital_properly(match_summary, processed_df, econ_params)
         ann_cap_mer = cap_mer * 0.2
         opex_mer = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
         tac_mer = opex_mer + ann_cap_mer
@@ -764,6 +768,3 @@ if st.session_state.get('run_clicked'):
         import traceback
         st.code(traceback.format_exc())
         st.info("Please check your input data and try again.")
-
-
-
