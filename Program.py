@@ -110,16 +110,72 @@ GA_CONFIG = {
 
 def render_optimization_inputs():
     st.markdown("### 4. Optimization & Economics Parameters")
-    with st.expander("Economic Coefficients (Plant Specific)", expanded=True):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            a = st.number_input("Fixed Investment [a] ($)", value=8000.0)
-            c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0)
-        with col2:
-            b = st.number_input("Area Coefficient [b] ($/m²)", value=1200.0)
-            c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0)
-        with col3:
-            c = st.number_input("Area Exponent [c]", value=0.6, step=0.01)
+    
+    with st.expander("⚠️ Cost Formula Selection", expanded=True):
+        cost_formula = st.radio(
+            "Select capital cost formula",
+            options=["Benchmark (Linnhoff)", "Custom (a + b×A^c)"],
+            index=0,
+            help="""
+            **Benchmark (Linnhoff)**: Annual cost = 1000 × A^0.6 ($/yr)
+            - Simpler formula from literature
+            - Directly gives annual cost (no annualization factor needed)
+            - Use this to match benchmark problems
+            
+            **Custom**: Total capital = a + b × A^c, Annual = Total × factor
+            - More flexible for different plants
+            - Includes fixed cost (a) and custom exponent (c)
+            """
+        )
+    
+    if cost_formula == "Benchmark (Linnhoff)":
+        st.info("Using benchmark formula: **Annual cost = 1000 × A^0.6** ($/yr)")
+        econ_params = {
+            "formula": "benchmark",
+            "c_hu": 80.0,
+            "c_cu": 20.0
+        }
+        
+        # Still allow customization
+        with st.expander("Customize benchmark parameters", expanded=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                cost_coef = st.number_input("Cost Coefficient ($/m^0.6)", value=1000.0)
+                c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0)
+            with col2:
+                cost_exp = st.number_input("Area Exponent", value=0.6, step=0.01)
+                c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0)
+            
+            econ_params.update({
+                "cost_coef": cost_coef,
+                "cost_exp": cost_exp,
+                "c_hu": c_hu,
+                "c_cu": c_cu
+            })
+        
+        # Set default values if not customized
+        if "cost_coef" not in econ_params:
+            econ_params.update({"cost_coef": 1000.0, "cost_exp": 0.6})
+            
+    else:  # Custom formula
+        with st.expander("Economic Coefficients (Plant Specific)", expanded=True):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                a = st.number_input("Fixed Investment [a] ($)", value=8000.0)
+                c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0)
+            with col2:
+                b = st.number_input("Area Coefficient [b] ($/m²)", value=1200.0)
+                c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0)
+            with col3:
+                c = st.number_input("Area Exponent [c]", value=0.6, step=0.01)
+                ann_factor = st.number_input("Annualization Factor", value=0.2, step=0.01)
+        
+        econ_params = {
+            "formula": "custom",
+            "a": a, "b": b, "c": c,
+            "c_hu": c_hu, "c_cu": c_cu,
+            "ann_factor": ann_factor
+        }
     
     with st.expander("⚠️ Heat Transfer Coefficient Units Correction", expanded=True):
         st.warning("""
@@ -129,15 +185,25 @@ def render_optimization_inputs():
         h_factor = st.selectbox(
             "h value unit conversion factor",
             options=[1.0, 0.1, 0.01, 0.001],
-            index=1,  # Default to 0.1
+            index=0,  # Default to 1.0 for benchmark (h=1.6 is correct)
             help="""
-            - 1.0 = h already in kW/m²K (typical range 0.1-0.5)
-            - 0.1 = h needs scaling down by 10x (use if h values are 1-5)
+            - 1.0 = h already in kW/m²K (typical range 0.1-5)
+            - 0.1 = h needs scaling down by 10x (use if h values are 10-50)
             - 0.01 = h in 100× units
             - 0.001 = h in W/m²K (convert to kW/m²K)
             """
         )
         st.info(f"Current setting: h values will be multiplied by {h_factor}")
+    
+    with st.expander("Utility Heat Transfer Coefficients", expanded=True):
+        st.info("Enter h values for hot and cold utilities (for heaters/coolers)")
+        util_col1, util_col2 = st.columns(2)
+        with util_col1:
+            h_hu = st.number_input("Hot Utility h (kW/m²K)", value=4.8, help="For steam condensers, etc.")
+        with util_col2:
+            h_cu = st.number_input("Cold Utility h (kW/m²K)", value=1.6, help="For cooling water, etc.")
+        
+        econ_params.update({"h_hu": h_hu, "h_cu": h_cu})
     
     with st.expander("Genetic Algorithm Settings", expanded=False):
         ga_col1, ga_col2 = st.columns(2)
@@ -153,12 +219,32 @@ def render_optimization_inputs():
         GA_CONFIG["num_parents_mating"] = num_parents
         GA_CONFIG["mutation_percent_genes"] = mutation_rate
     
-    return {"a": a, "b": b, "c": c, "c_hu": c_hu, "c_cu": c_cu, "h_factor": h_factor}
+    econ_params["h_factor"] = h_factor
+    return econ_params
 
 def prepare_optimizer_data(df):
     hot_streams = df[df['Type'] == 'Hot'].to_dict('records')
     cold_streams = df[df['Type'] == 'Cold'].to_dict('records')
     return hot_streams, cold_streams
+
+def calculate_hex_capital(area, econ_params):
+    """
+    Calculate capital cost for a single heat exchanger
+    Returns annual capital cost in $/yr
+    """
+    if econ_params.get("formula") == "benchmark":
+        # Benchmark formula: Annual cost = cost_coef × A^cost_exp
+        cost_coef = econ_params.get("cost_coef", 1000.0)
+        cost_exp = econ_params.get("cost_exp", 0.6)
+        return cost_coef * (area ** cost_exp)
+    else:
+        # Custom formula: Total = a + b × A^c, Annual = Total × ann_factor
+        a = econ_params.get("a", 8000.0)
+        b = econ_params.get("b", 1200.0)
+        c = econ_params.get("c", 0.6)
+        ann_factor = econ_params.get("ann_factor", 0.2)
+        total_capital = a + b * (area ** c)
+        return total_capital * ann_factor
 
 def match_logic_with_splitting(df, pinch_t, side):
     """
@@ -249,8 +335,8 @@ def decode_solution(solution, match_pairs):
             })
     return matches
 
-def calculate_tac_for_matches(matches, hot_streams, cold_streams, econ_params, dt_min, annual_factor=0.2):
-    """Calculate Total Annual Cost for a given network configuration"""
+def calculate_tac_for_matches(matches, hot_streams, cold_streams, econ_params, dt_min):
+    """Calculate Total Annual Cost for a given network configuration - NOW INCLUDES UTILITIES!"""
     rem_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
     rem_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
     total_inv = 0
@@ -290,14 +376,36 @@ def calculate_tac_for_matches(matches, hot_streams, cold_streams, econ_params, d
             return float('inf')
             
         area = q / (u * lmtd)
-        total_inv += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
+        total_inv += calculate_hex_capital(area, econ_params)
 
     # Calculate utility costs
     actual_qh = sum(max(0, val) for val in rem_c.values())
     actual_qc = sum(max(0, val) for val in rem_h.values())
     opex = (actual_qh * econ_params['c_hu']) + (actual_qc * econ_params['c_cu'])
     
-    return opex + (total_inv * annual_factor)
+    # ===== ADD UTILITY HEAT EXCHANGERS TO CAPITAL =====
+    h_hu = econ_params.get('h_hu', 4.8)
+    h_cu = econ_params.get('h_cu', 1.6)
+    
+    # Hot utility heaters
+    if actual_qh > 0.1:
+        lmtd_util = 50.0
+        h_cold_avg = np.mean([s['h'] for s in cold_streams]) if cold_streams else 1.6
+        u_hu = calculate_u(h_hu, h_cold_avg, h_factor)
+        if u_hu > 0:
+            area_hu = actual_qh / (u_hu * lmtd_util)
+            total_inv += calculate_hex_capital(area_hu, econ_params)
+    
+    # Cold utility coolers
+    if actual_qc > 0.1:
+        lmtd_util = 30.0
+        h_hot_avg = np.mean([s['h'] for s in hot_streams]) if hot_streams else 1.6
+        u_cu = calculate_u(h_hot_avg, h_cu, h_factor)
+        if u_cu > 0:
+            area_cu = actual_qc / (u_cu * lmtd_util)
+            total_inv += calculate_hex_capital(area_cu, econ_params)
+    
+    return opex + total_inv  # total_inv is already annual cost
 
 def fitness_function(ga_instance, solution, solution_idx):
     """Fitness function for PyGAD - minimize TAC (return negative for maximization)"""
@@ -400,9 +508,10 @@ def calculate_no_integration_costs(df, econ_params):
         'qc': qc_total
     }
 
-def calculate_mer_capital_properly(match_summary, processed_df, econ_params, pinch_t, dt_min):
+def calculate_mer_capital_properly(match_summary, processed_df, econ_params, pinch_t, dt_min, qh_util, qc_util):
     """
     Calculate MER capital cost treating Above/Below pinch as separate systems.
+    NOW INCLUDES UTILITY HEAT EXCHANGERS!
     
     CRITICAL FIX: This function now correctly handles stream splitting at the pinch.
     
@@ -416,11 +525,13 @@ def calculate_mer_capital_properly(match_summary, processed_df, econ_params, pin
     - Used global supply temps (Ts) for ALL matches
     - For "Below Pinch" matches, this created temperature crosses
     - LMTD became tiny (0.001) → huge areas → 4x inflated capital cost
+    - ALSO: Forgot to include heaters and coolers in capital cost!
     
     The Fix (Now):
     - Above Pinch: Hot uses Ts, Cold starts at Pinch
     - Below Pinch: Hot starts at Pinch, Cold uses Ts
     - This prevents temperature crosses and gives correct LMTD
+    - PLUS: Adds capital cost for utility heat exchangers
     """
     cap_mer = 0
     h_factor = econ_params.get('h_factor', 1.0)
@@ -430,6 +541,7 @@ def calculate_mer_capital_properly(match_summary, processed_df, econ_params, pin
     pinch_real_hot = pinch_t
     pinch_real_cold = pinch_t - dt_min
     
+    # ===== PROCESS-TO-PROCESS HEAT EXCHANGERS =====
     for m in match_summary:
         duty = m['Duty [kW]']
         if duty <= 0:
@@ -486,11 +598,56 @@ def calculate_mer_capital_properly(match_summary, processed_df, econ_params, pin
                 
                 if u > 0 and lmtd > 0:
                     area = duty / (u * lmtd)
-                    cap_mer += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
+                    cap_mer += calculate_hex_capital(area, econ_params)
                     
         except Exception as e:
             # Skip invalid matches
             continue
+    
+    # ===== UTILITY HEAT EXCHANGERS =====
+    # Add capital cost for heaters (hot utility) and coolers (cold utility)
+    
+    h_hu = econ_params.get('h_hu', 4.8)
+    h_cu = econ_params.get('h_cu', 1.6)
+    
+    # Hot Utility (Heaters) - if Qh > 0
+    if qh_util > 0.1:
+        # Find cold streams that need heating
+        # Assume hot utility at high temperature (e.g., 450 K from benchmark)
+        # and average cold stream needs heating at around 350 K
+        # Use simplified LMTD calculation
+        t_hu_in = 450  # Hot utility inlet (e.g., steam)
+        t_hu_out = 450  # Isothermal for condensing steam
+        
+        # Average approach temperature for utility ~50°C is typical
+        lmtd_util = 50.0  # Conservative estimate
+        
+        # Calculate U for hot utility
+        # Use highest cold stream h value as representative
+        h_cold_avg = processed_df[processed_df['Type'] == 'Cold']['h'].mean() if len(processed_df[processed_df['Type'] == 'Cold']) > 0 else 1.6
+        u_hu = calculate_u(h_hu, h_cold_avg, h_factor)
+        
+        if u_hu > 0:
+            area_hu = qh_util / (u_hu * lmtd_util)
+            cap_mer += calculate_hex_capital(area_hu, econ_params)
+    
+    # Cold Utility (Coolers) - if Qc > 0
+    if qc_util > 0.1:
+        # Find hot streams that need cooling
+        # Assume cold utility at low temperature (e.g., 293-313 K from benchmark)
+        t_cu_in = 293  # Cold utility inlet
+        t_cu_out = 313  # Cold utility outlet
+        
+        # Average approach temperature
+        lmtd_util = 30.0  # Conservative estimate
+        
+        # Calculate U for cold utility
+        h_hot_avg = processed_df[processed_df['Type'] == 'Hot']['h'].mean() if len(processed_df[processed_df['Type'] == 'Hot']) > 0 else 1.6
+        u_cu = calculate_u(h_hot_avg, h_cu, h_factor)
+        
+        if u_cu > 0:
+            area_cu = qc_util / (u_cu * lmtd_util)
+            cap_mer += calculate_hex_capital(area_cu, econ_params)
     
     return cap_mer
 
@@ -615,11 +772,13 @@ if st.session_state.get('run_clicked'):
                         else:
                             st.success("✓ U value in reasonable range for industrial heat exchangers") 
         
-        # MER Economics Calculation - Now with correct pinch splitting
-        cap_mer = calculate_mer_capital_properly(match_summary, processed_df, econ_params, pinch, dt_min_input)
-        ann_cap_mer = cap_mer * 0.2
+        # MER Economics Calculation - Now with correct pinch splitting AND utilities
+        cap_mer = calculate_mer_capital_properly(match_summary, processed_df, econ_params, pinch, dt_min_input, qh, qc)
+        ann_cap_mer = cap_mer  # Already in annual terms from calculate_hex_capital
         opex_mer = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
         tac_mer = opex_mer + ann_cap_mer
+        
+        num_mer_utility_hex = (1 if qh > 0.1 else 0) + (1 if qc > 0.1 else 0)
 
         st.markdown("#### MER Economic Breakdown")
         u_col1, u_col2 = st.columns(2)
@@ -627,7 +786,8 @@ if st.session_state.get('run_clicked'):
         u_col2.metric("Cold Utility (Qc)", f"{qc:,.2f} kW", help="Minimum cold utility from pinch analysis")
         
         m_col1, m_col2, m_col3 = st.columns(3)
-        m_col1.metric("Capital Cost", f"${cap_mer:,.2f}", f"(${ann_cap_mer:,.2f}/yr)")
+        m_col1.metric("Annual Capital Cost", f"${ann_cap_mer:,.2f}/yr", 
+                     f"({len(match_summary)} process + {num_mer_utility_hex} utility HEX)")
         m_col2.metric("Annual Operating Cost", f"${opex_mer:,.2f}/yr")
         m_col3.metric("Total Annual Cost (TAC)", f"${tac_mer:,.2f}/yr")
 
@@ -653,7 +813,7 @@ if st.session_state.get('run_clicked'):
             
             if optimized_matches:
                 display_matches = []
-                final_cap = 0
+                final_cap_process = 0  # Capital for process-to-process HEX
                 
                 # Calculate remaining duties
                 rem_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
@@ -674,7 +834,7 @@ if st.session_state.get('run_clicked'):
                     
                     if l_val > 0 and u > 0:
                         area = q / (u * l_val)
-                        final_cap += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
+                        final_cap_process += calculate_hex_capital(area, econ_params)
                         
                         # Update remaining duties
                         rem_h[hs['Stream']] -= q
@@ -690,9 +850,33 @@ if st.session_state.get('run_clicked'):
                 final_qh = sum(max(0, val) for val in rem_c.values())
                 final_qc = sum(max(0, val) for val in rem_h.values())
                 
-                ann_cap_opt = final_cap * 0.2
+                # Add utility heat exchangers to capital cost
+                final_cap_utilities = 0
+                h_hu = econ_params.get('h_hu', 4.8)
+                h_cu = econ_params.get('h_cu', 1.6)
+                
+                if final_qh > 0.1:
+                    lmtd_util = 50.0
+                    h_cold_avg = np.mean([s['h'] for s in cold_streams]) if cold_streams else 1.6
+                    u_hu = calculate_u(h_hu, h_cold_avg, econ_params['h_factor'])
+                    if u_hu > 0:
+                        area_hu = final_qh / (u_hu * lmtd_util)
+                        final_cap_utilities += calculate_hex_capital(area_hu, econ_params)
+                
+                if final_qc > 0.1:
+                    lmtd_util = 30.0
+                    h_hot_avg = np.mean([s['h'] for s in hot_streams]) if hot_streams else 1.6
+                    u_cu = calculate_u(h_hot_avg, h_cu, econ_params['h_factor'])
+                    if u_cu > 0:
+                        area_cu = final_qc / (u_cu * lmtd_util)
+                        final_cap_utilities += calculate_hex_capital(area_cu, econ_params)
+                
+                # Total capital (already annual cost)
+                ann_cap_opt = final_cap_process + final_cap_utilities
                 opex_opt = (final_qh * econ_params['c_hu']) + (final_qc * econ_params['c_cu'])
                 tac_opt_actual = ann_cap_opt + opex_opt
+                
+                num_utility_hex = (1 if final_qh > 0.1 else 0) + (1 if final_qc > 0.1 else 0)
 
                 st.markdown("#### Optimized Heat Exchanger Network")
                 st.dataframe(pd.DataFrame(display_matches), use_container_width=True)
@@ -703,7 +887,8 @@ if st.session_state.get('run_clicked'):
                 opt_u_col2.metric("Cold Utility (Qc)", f"{final_qc:,.2f} kW")
 
                 o_col1, o_col2, o_col3 = st.columns(3)
-                o_col1.metric("Capital Cost", f"${final_cap:,.2f}", f"(${ann_cap_opt:,.2f}/yr)")
+                o_col1.metric("Annual Capital Cost", f"${ann_cap_opt:,.2f}/yr", 
+                             f"({len(optimized_matches)} process + {num_utility_hex} utility HEX)")
                 o_col2.metric("Annual Operating Cost", f"${opex_opt:,.2f}/yr")
                 o_col3.metric("Total Annual Cost (TAC)", f"${tac_opt_actual:,.2f}/yr")
 
@@ -741,12 +926,9 @@ if st.session_state.get('run_clicked'):
                 # Create comparison table
                 comparison_df = pd.DataFrame({
                     "Configuration": ["No Integration", "MER Setup", "Optimized (GA)"],
-                    "Heat Exchangers": [0, len(match_summary), len(optimized_matches)],
-                    "Capital Cost ($)": [
-                        f"{no_int['capital']:,.2f}",
-                        f"{cap_mer:,.2f}",
-                        f"{final_cap:,.2f}"
-                    ],
+                    "Process HEX": [0, len(match_summary), len(optimized_matches)],
+                    "Utility HEX": [0, num_mer_utility_hex, num_utility_hex],
+                    "Total HEX": [0, len(match_summary) + num_mer_utility_hex, len(optimized_matches) + num_utility_hex],
                     "Annual Capital ($/yr)": [
                         f"{no_int['ann_capital']:,.2f}",
                         f"{ann_cap_mer:,.2f}",
