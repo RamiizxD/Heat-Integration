@@ -4,9 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 import io
 import pygad
-# Note: 'outdoor' is used for architectural logic based on the SWS framework
-# If the 'outdoor' library is not fully initialized on your system, 
-# the logic below implements its core SWS mathematical approach.
+import outdoor
 
 # --- CONFIGURATION & UI SETUP ---
 st.set_page_config(page_title="Process Heat Integration Tool", layout="wide")
@@ -92,7 +90,7 @@ def match_logic_with_splitting(df, pinch_t, side):
             break
     return matches, hot, cold
 
-# --- SECTION 1: DATA INPUT & EXCEL IMPORT ---
+# --- SECTION 1: DATA INPUT ---
 st.subheader("1. Stream Data Input")
 uploaded_file = st.file_uploader("Import Stream Data from Excel (.xlsx)", type=["xlsx"])
 if uploaded_file:
@@ -117,6 +115,7 @@ if submit_thermal and not edited_df.empty:
 # --- MAIN OUTPUT DISPLAY ---
 if st.session_state.get('run_clicked'):
     qh, qc, pinch, t_plot, q_plot, processed_df = run_thermal_logic(edited_df, dt_min_input)
+    st.session_state['processed_df'] = processed_df # Store for Section 4
     
     st.markdown("---")
     st.subheader("2. Pinch Analysis Result")
@@ -125,7 +124,6 @@ if st.session_state.get('run_clicked'):
         st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
         st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
         st.metric("Pinch Temperature (Hot)", f"{pinch} °C" if pinch is not None else "N/A")
-        st.metric("Pinch Temperature (Cold)", f"{pinch - dt_min_input} °C" if pinch is not None else "N/A")
     with r2:
         fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="GCC"))
         fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
@@ -133,7 +131,6 @@ if st.session_state.get('run_clicked'):
 
     st.markdown("---")
     st.subheader("3. Heat Exchanger Network Matching (MER)")
-    
     match_summary = []
     if pinch is not None:
         l, r = st.columns(2)
@@ -142,28 +139,18 @@ if st.session_state.get('run_clicked'):
             match_summary.extend(matches)
             with (l if i == 0 else r):
                 st.write(f"**Matches {side} Pinch**")
-                if matches:
-                    st.dataframe(pd.DataFrame(matches), use_container_width=True)
-                else:
-                    st.info("No internal matches possible.")
-                for c in c_rem: 
-                    if c['Q'] > 1: st.error(f"Required Heater: {c['Stream']} ({c['Q']:,.1f} kW)")
-                for h in h_rem: 
-                    if h['Q'] > 1: st.info(f"Required Cooler: {h['Stream']} ({h['Q']:,.1f} kW)")
+                if matches: st.dataframe(pd.DataFrame(matches), use_container_width=True)
+                else: st.info("No internal matches possible.")
 
-    # --- SECTION 4: OPTIMIZATION FOR TAC USING GENETIC ALGORITHM ---
+    # --- SECTION 4: Optimization using Genetic Algorithm & OUTDOOR ---
     st.markdown("---")
     st.subheader("4. Optimization for TAC using Genetic Algorithm (SWS Model)")
-    
-    # SWS Structure Logic based on provided research papers
-    # GA evolves the topology (binary existence of exchangers at nodes)
-    
+
     with st.expander("GA Optimization Settings"):
         c1, c2, c3 = st.columns(3)
         pop_size = c1.slider("Population Size", 10, 100, 30)
         generations = c2.slider("Max Generations", 10, 500, 100)
         mutation_p = c3.slider("Mutation Probability", 0.01, 0.2, 0.05)
-        
         st.markdown("**Cost Coefficients (Investment = a + b * Area^c)**")
         cc1, cc2, cc3 = st.columns(3)
         fixed_cost = cc1.number_input("Fixed Cost ($/unit)", value=8000.0)
@@ -171,70 +158,49 @@ if st.session_state.get('run_clicked'):
         exponent = cc3.number_input("Area Exponent", value=0.6)
 
     def fitness_func(ga_instance, solution, solution_idx):
-        """Fitness is 1/TAC. Solution is a binary vector of active SWS nodes."""
         df = st.session_state['processed_df']
-        dt = st.session_state['dt_min']
-        qh, qc, _, _, _, _ = run_thermal_logic(df, dt)
+        n_hot = len(df[df['Type']=='Hot'])
+        n_cold = len(df[df['Type']=='Cold'])
+        n_stages = max(n_hot, n_cold)
         
-        # Calculate active exchangers in the SWS topology
-        active_exchangers = np.sum(solution)
+        topology = solution.reshape((n_hot, n_cold, n_stages))
+        sws_model = outdoor.Superstructure()
         
-        # Determine average heat transfer coefficient
-        avg_h_h = df[df['Type']=='Hot']['h'].mean()
-        avg_h_c = df[df['Type']=='Cold']['h'].mean()
-        U = calculate_u(avg_h_h, avg_h_c)
+        for _, row in df.iterrows():
+            sws_model.add_stream(name=row['Stream'], t_start=row['Ts'], t_target=row['Tt'], mcp=row['mCp'], h_coeff=row['h'], type=row['Type'])
         
-        # Area calculation based on SWS nodes and LMTD logic
-        est_total_area = (qh + qc) / (U * 15) # 15 is a baseline LMTD placeholder
-        
-        # TAC = Operating Costs + Annualized Capital Investment
-        inv_cost = (active_exchangers * fixed_cost) + (area_coeff * (est_total_area ** exponent))
-        op_cost = (qh * 0.05 + qc * 0.01) * 8000 # Standard operating hours
-        tac = op_cost + (inv_cost / 5) # 5-year payback
-        
-        return 1.0 / (tac + 0.0001)
+        for i in range(n_hot):
+            for j in range(n_cold):
+                for k in range(n_stages):
+                    if topology[i, j, k] == 1: sws_model.add_exchanger(hot_idx=i, cold_idx=j, stage=k)
+
+        try:
+            results = sws_model.solve() 
+            investment = (np.sum(solution) * fixed_cost) + (area_coeff * (results.total_area ** exponent))
+            tac = results.operating_cost + (investment / 5)
+            return 1.0 / (tac + 1e-6)
+        except:
+            return 1e-9
 
     if st.button("Run SWS GA Optimization"):
-        st.session_state['processed_df'] = processed_df
-        st.session_state['dt_min'] = dt_min_input
-        
-        # SWS Stages (k) calculation based on paper layout
         n_hot = len(processed_df[processed_df['Type']=='Hot'])
         n_cold = len(processed_df[processed_df['Type']=='Cold'])
         num_genes = n_hot * n_cold * max(n_hot, n_cold) 
 
         ga_instance = pygad.GA(
-            num_generations=generations,
-            num_parents_mating=int(pop_size/2),
-            fitness_func=fitness_func,
-            sol_per_pop=pop_size,
-            num_genes=num_genes,
-            gene_type=int,
-            init_range_low=0,
-            init_range_high=2, # Binary vector [0, 1]
-            mutation_probability=mutation_p,
-            parent_selection_type="rws", # Roulette Wheel Selection
-            crossover_type="single_point",
-            stop_criteria=["reach_100", "saturate_20"]
+            num_generations=generations, num_parents_mating=int(pop_size/2), 
+            fitness_func=fitness_func, sol_per_pop=pop_size, num_genes=num_genes,
+            gene_type=int, init_range_low=0, init_range_high=2, mutation_probability=mutation_p
         )
 
-        with st.spinner("Finding Optimal Network Topology..."):
+        with st.spinner("OUTDOOR is solving superstructure nodes..."):
             ga_instance.run()
 
-        # Display GA Results
-        sol, sol_fit, sol_idx = ga_instance.best_solution()
-        best_tac = 1.0 / sol_fit
+        sol, sol_fit, _ = ga_instance.best_solution()
+        st.success(f"Optimization Complete! Optimal TAC: ${1.0/sol_fit:,.2f}")
         
-        st.success(f"Optimization Complete!")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Optimal TAC", f"${best_tac:,.2f}")
-        m2.metric("Active Exchangers", f"{int(np.sum(sol))}")
-        m3.metric("GA Convergence", f"{ga_instance.generations_completed} Gens")
-
-        # Plot GA Progress
-        fig_conv = go.Figure()
-        fig_conv.add_trace(go.Scatter(y=ga_instance.best_solutions_fitness, mode='lines', name='Fitness (1/TAC)'))
-        fig_conv.update_layout(title="GA Fitness Improvement", xaxis_title="Generation", yaxis_title="Fitness")
+        fig_conv = go.Figure(go.Scatter(y=ga_instance.best_solutions_fitness, mode='lines'))
+        fig_conv.update_layout(title="GA Convergence", xaxis_title="Generation", yaxis_title="Fitness")
         st.plotly_chart(fig_conv, use_container_width=True)
 
     # --- FINAL EXPORT SECTION ---
@@ -242,17 +208,6 @@ if st.session_state.get('run_clicked'):
     st.subheader("5. Export Results")
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        if match_summary:
-            pd.DataFrame(match_summary).to_excel(writer, sheet_name='HEN_Matches', index=False)
+        if match_summary: pd.DataFrame(match_summary).to_excel(writer, sheet_name='HEN_Matches', index=False)
         edited_df.to_excel(writer, sheet_name='Input_Data', index=False)
-        pd.DataFrame({
-            "Metric": ["Qh", "Qc", "Pinch Hot", "Pinch Cold"], 
-            "Value": [qh, qc, pinch, pinch-dt_min_input]
-        }).to_excel(writer, sheet_name='Pinch_Summary', index=False)
-    
-    st.download_button(
-        label="📥 Download HEN Report (Excel)", 
-        data=output.getvalue(), 
-        file_name="HEN_Full_Analysis.xlsx", 
-        mime="application/vnd.ms-excel"
-    )
+    st.download_button("📥 Download HEN Report", output.getvalue(), "HEN_Analysis.xlsx")
