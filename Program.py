@@ -210,9 +210,10 @@ matches.append({
                     "Side": side  # Added to track if match is Above or Below pinch
                 })
             else:
-                # Skip this match if split ratio is too small
+                # This breaks the 'for' loop if the split ratio is too small
                 break
         else:
+            # This breaks the inner 'while' loop if no more duty can be matched
             break
             
     return matches, hot, cold
@@ -765,4 +766,5 @@ if st.session_state.get('run_clicked'):
         import traceback
         st.code(traceback.format_exc())
         st.info("Please check your input data and try again.")
+
 
