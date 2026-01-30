@@ -89,7 +89,6 @@ def prune_and_normalize_matches(matches, streams_data):
     """
     Implements the paper's pruning logic (Section 3.2):
     1. Removes units with heat load < 10% of the total stream capacity.
-    This prevents very small splits that are economically unviable.
     """
     pruned_matches = []
     for m in matches:
@@ -159,7 +158,6 @@ def match_logic_with_splitting(df, pinch_t, side):
                 })
             else:
                 # Skip this match if split ratio is too small
-                # Try to match with another stream
                 break
         else:
             break
@@ -206,7 +204,6 @@ def find_q_dep(h_stream, c_stream, econ_params, dt_min):
         util_savings = q_ne * (econ_params['c_hu'] + econ_params['c_cu'])
         
         # FIX #2: Correct DEP condition from paper
-        # DEP is where annualized investment equals utility savings
         if abs(ann_inv - util_savings) <= 0.01:  # Found DEP
             return round(q_ne, 2)
         elif ann_inv > util_savings:  # Haven't reached DEP yet
@@ -271,7 +268,6 @@ def calculate_current_tac(matches, hot_streams, cold_streams, econ_params, dt_mi
 def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, dt_min):
     """
     Random walk with compulsive evolution (RWCE)
-    FIX #3: Improved convergence criteria and step size adaptation
     """
     best_matches = copy.deepcopy(initial_matches)
     current_tac = calculate_current_tac(best_matches, hot_streams, cold_streams, econ_params, dt_min)
@@ -289,7 +285,7 @@ def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, dt_
         idx = np.random.randint(0, len(best_matches))
         old_q = best_matches[idx]['Recommended Load [kW]']
         
-        # Adaptive step size - reduce as optimization progresses
+        # Adaptive step size
         if no_improvement > 500:
             delta_l = max(1.0, delta_l * 0.95)
             no_improvement = 0
@@ -329,6 +325,61 @@ def calculate_no_integration_costs(df, econ_params):
         'qh': qh_total,
         'qc': qc_total
     }
+
+def calculate_mer_capital_properly(match_summary, processed_df, econ_params):
+    """
+    Calculate MER capital cost using actual U and LMTD for each match
+    This ensures consistency with TAC optimization
+    """
+    cap_mer = 0
+    
+    for m in match_summary:
+        duty = m['Duty [kW]']
+        if duty <= 0:
+            continue
+            
+        # Extract stream numbers from match string
+        match_str = m['Match']
+        # Remove ratio prefix if present (e.g., "0.67 Stream 1 ↔ 5" -> "Stream 1 ↔ 5")
+        if ' ' in match_str and match_str.split()[0].replace('.', '').isdigit():
+            match_str = ' '.join(match_str.split()[1:])
+        
+        # Now parse "Stream X ↔ Y"
+        try:
+            match_parts = match_str.replace('Stream ', '').split(' ↔ ')
+            h_stream_id = match_parts[0].strip()
+            c_stream_id = match_parts[1].strip()
+            
+            # Find the hot and cold streams
+            h_stream = None
+            c_stream = None
+            
+            for _, row in processed_df.iterrows():
+                if str(row['Stream']) == h_stream_id and row['Type'] == 'Hot':
+                    h_stream = row
+                if str(row['Stream']) == c_stream_id and row['Type'] == 'Cold':
+                    c_stream = row
+            
+            if h_stream is not None and c_stream is not None:
+                # Calculate actual U for this match
+                u = calculate_u(h_stream['h'], c_stream['h'])
+                
+                if u > 0:
+                    # Calculate outlet temperatures
+                    tho = h_stream['S_Ts'] - (duty / h_stream['mCp'])
+                    tco = c_stream['S_Ts'] + (duty / c_stream['mCp'])
+                    
+                    # Calculate LMTD using Chen approximation
+                    lmtd = lmtd_chen(h_stream['S_Ts'], tho, c_stream['S_Ts'], tco)
+                    
+                    if lmtd > 0:
+                        area = duty / (u * lmtd)
+                        cap_mer += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
+        except:
+            # If parsing fails, skip this match
+            continue
+    
+    return cap_mer
 
 # --- UI LOGIC ---
 st.subheader("1. Stream Data Input")
@@ -385,22 +436,22 @@ if st.session_state.get('run_clicked'):
 
     econ_params = render_optimization_inputs() 
     
-    # MER Economics Calculation
-    total_mer_q = sum(m['Duty [kW]'] for m in match_summary)
-    if total_mer_q > 0:
-        # Estimate average U for MER (simplified - could be improved)
-        avg_u = 0.5  # kW/m²K - typical for process streams
-        avg_lmtd = 20.0  # °C - typical approach
-        area_mer = total_mer_q / (avg_u * avg_lmtd)
-    else:
-        area_mer = 0
-        
-    cap_mer = econ_params['a'] * len(match_summary) + econ_params['b'] * (area_mer ** econ_params['c']) if area_mer > 0 else 0
+    # MER Economics Calculation - FIXED VERSION
+    # Calculate capital cost properly using actual U and LMTD
+    cap_mer = calculate_mer_capital_properly(match_summary, processed_df, econ_params)
+    
     ann_cap_mer = cap_mer * DGS_CONFIG['ANNUAL_FACTOR']
+    # IMPORTANT: Use qh and qc from pinch analysis (minimum utilities)
     opex_mer = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
     tac_mer = opex_mer + ann_cap_mer
 
     st.markdown("#### MER Economic Breakdown")
+    # FIX: Display utilities prominently
+    u_col1, u_col2 = st.columns(2)
+    u_col1.metric("Hot Utility (Qh)", f"{qh:,.2f} kW", help="Minimum hot utility from pinch analysis")
+    u_col2.metric("Cold Utility (Qc)", f"{qc:,.2f} kW", help="Minimum cold utility from pinch analysis")
+    
+    # Then display costs
     m_col1, m_col2, m_col3 = st.columns(3)
     m_col1.metric("Capital Cost", f"${cap_mer:,.2f}", f"(${ann_cap_mer:,.2f}/yr)")
     m_col2.metric("Annual Operating Cost", f"${opex_mer:,.2f}/yr")
@@ -487,6 +538,11 @@ if st.session_state.get('run_clicked'):
                 tac_opt = ann_cap_opt + opex_opt
 
                 st.dataframe(pd.DataFrame(display_matches), use_container_width=True)
+                
+                # Display utilities
+                opt_u_col1, opt_u_col2 = st.columns(2)
+                opt_u_col1.metric("Hot Utility (Qh)", f"{final_qh:,.2f} kW")
+                opt_u_col2.metric("Cold Utility (Qc)", f"{final_qc:,.2f} kW")
 
                 o_col1, o_col2, o_col3 = st.columns(3)
                 o_col1.metric("Capital Cost", f"${final_cap:,.2f}", f"(${ann_cap_opt:,.2f}/yr)")
@@ -498,6 +554,14 @@ if st.session_state.get('run_clicked'):
                 
                 # Calculate no integration case
                 no_int = calculate_no_integration_costs(edited_df, econ_params)
+                
+                # Important Note about utilities
+                st.info("""
+                **Note on Utility Consumption:**
+                - **MER Setup**: Uses minimum utilities from pinch analysis (Qh = {:.2f} kW, Qc = {:.2f} kW)
+                - **Optimized TAC**: May use MORE utilities ({:.2f} kW, {:.2f} kW) to reduce capital cost
+                - This is expected behavior - TAC optimization trades utility cost for lower capital investment
+                """.format(qh, qc, final_qh, final_qc))
                 
                 # Create comparison table
                 comparison_df = pd.DataFrame({
