@@ -1,2 +1,4 @@
 glpk-utils
+libglpk-dev
 graphviz
+graphviz-dev
