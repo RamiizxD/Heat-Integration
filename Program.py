@@ -213,7 +213,7 @@ if h_ratio >= GA_CONFIG["min_split_ratio"] or h_ratio >= 0.99:
     })
 else:
     # Skip this match if split ratio is too small
-    break
+    continue
 
 
 # --- GENETIC ALGORITHM IMPLEMENTATION ---
@@ -764,5 +764,6 @@ if st.session_state.get('run_clicked'):
         import traceback
         st.code(traceback.format_exc())
         st.info("Please check your input data and try again.")
+
 
 
