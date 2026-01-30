@@ -116,6 +116,7 @@ def render_optimization_inputs():
             "Select capital cost formula",
             options=["Benchmark (Linnhoff)", "Custom (a + b×A^c)"],
             index=0,
+            key="cost_formula_radio",
             help="""
             **Benchmark (Linnhoff)**: Annual cost = 1000 × A^0.6 ($/yr)
             - Simpler formula from literature
@@ -140,11 +141,11 @@ def render_optimization_inputs():
         with st.expander("Customize benchmark parameters", expanded=False):
             col1, col2 = st.columns(2)
             with col1:
-                cost_coef = st.number_input("Cost Coefficient ($/m^0.6)", value=1000.0)
-                c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0)
+                cost_coef = st.number_input("Cost Coefficient ($/m^0.6)", value=1000.0, key="bench_cost_coef")
+                c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0, key="bench_c_hu")
             with col2:
-                cost_exp = st.number_input("Area Exponent", value=0.6, step=0.01)
-                c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0)
+                cost_exp = st.number_input("Area Exponent", value=0.6, step=0.01, key="bench_cost_exp")
+                c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0, key="bench_c_cu")
             
             econ_params.update({
                 "cost_coef": cost_coef,
@@ -161,14 +162,14 @@ def render_optimization_inputs():
         with st.expander("Economic Coefficients (Plant Specific)", expanded=True):
             col1, col2, col3 = st.columns(3)
             with col1:
-                a = st.number_input("Fixed Investment [a] ($)", value=8000.0)
-                c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0)
+                a = st.number_input("Fixed Investment [a] ($)", value=8000.0, key="custom_a")
+                c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0, key="custom_c_hu")
             with col2:
-                b = st.number_input("Area Coefficient [b] ($/m²)", value=1200.0)
-                c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0)
+                b = st.number_input("Area Coefficient [b] ($/m²)", value=1200.0, key="custom_b")
+                c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0, key="custom_c_cu")
             with col3:
-                c = st.number_input("Area Exponent [c]", value=0.6, step=0.01)
-                ann_factor = st.number_input("Annualization Factor", value=0.2, step=0.01)
+                c = st.number_input("Area Exponent [c]", value=0.6, step=0.01, key="custom_c")
+                ann_factor = st.number_input("Annualization Factor", value=0.2, step=0.01, key="custom_ann_factor")
         
         econ_params = {
             "formula": "custom",
@@ -186,6 +187,7 @@ def render_optimization_inputs():
             "h value unit conversion factor",
             options=[1.0, 0.1, 0.01, 0.001],
             index=0,  # Default to 1.0 for benchmark (h=1.6 is correct)
+            key="h_factor_select",
             help="""
             - 1.0 = h already in kW/m²K (typical range 0.1-5)
             - 0.1 = h needs scaling down by 10x (use if h values are 10-50)
@@ -199,20 +201,20 @@ def render_optimization_inputs():
         st.info("Enter h values for hot and cold utilities (for heaters/coolers)")
         util_col1, util_col2 = st.columns(2)
         with util_col1:
-            h_hu = st.number_input("Hot Utility h (kW/m²K)", value=4.8, help="For steam condensers, etc.")
+            h_hu = st.number_input("Hot Utility h (kW/m²K)", value=4.8, key="h_hu_input", help="For steam condensers, etc.")
         with util_col2:
-            h_cu = st.number_input("Cold Utility h (kW/m²K)", value=1.6, help="For cooling water, etc.")
+            h_cu = st.number_input("Cold Utility h (kW/m²K)", value=1.6, key="h_cu_input", help="For cooling water, etc.")
         
         econ_params.update({"h_hu": h_hu, "h_cu": h_cu})
     
     with st.expander("Genetic Algorithm Settings", expanded=False):
         ga_col1, ga_col2 = st.columns(2)
         with ga_col1:
-            num_gen = st.number_input("Number of Generations", value=100, min_value=10, max_value=1000)
-            pop_size = st.number_input("Population Size", value=50, min_value=10, max_value=200)
+            num_gen = st.number_input("Number of Generations", value=100, min_value=10, max_value=1000, key="ga_num_gen")
+            pop_size = st.number_input("Population Size", value=50, min_value=10, max_value=200, key="ga_pop_size")
         with ga_col2:
-            num_parents = st.number_input("Parents Mating", value=10, min_value=2, max_value=50)
-            mutation_rate = st.number_input("Mutation Rate (%)", value=15, min_value=1, max_value=50)
+            num_parents = st.number_input("Parents Mating", value=10, min_value=2, max_value=50, key="ga_num_parents")
+            mutation_rate = st.number_input("Mutation Rate (%)", value=15, min_value=1, max_value=50, key="ga_mutation_rate")
         
         GA_CONFIG["num_generations"] = num_gen
         GA_CONFIG["sol_per_pop"] = pop_size
@@ -824,6 +826,10 @@ elif section == "Analysis & Optimization":
         )
         st.plotly_chart(fig, use_container_width=True)
         
+        # Get economic parameters ONCE for all calculations
+        st.markdown("---")
+        econ_params = render_optimization_inputs()
+        
         # MER Network Design
         st.markdown("---")
         st.markdown("### MER Network Design (Stream Splitting Allowed)")
@@ -844,12 +850,11 @@ elif section == "Analysis & Optimization":
             # Calculate MER capital cost with proper temperature tracking
             ann_cap_mer = calculate_mer_capital_properly(
                 match_summary, processed_df, 
-                render_optimization_inputs(), 
+                econ_params,  # Use the econ_params we already have
                 pinch_t, dt_min_input, qh, qc
             )
             
             # Display MER economics
-            econ_params = render_optimization_inputs()
             opex_mer = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
             tac_mer = ann_cap_mer + opex_mer
             
