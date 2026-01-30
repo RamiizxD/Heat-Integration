@@ -1,6 +1,8 @@
 streamlit
+pygad
 pandas
 numpy
 plotly
 openpyxl
 scipy
+
