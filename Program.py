@@ -310,13 +310,16 @@ def render_optimization_inputs():
         col1, col2, col3 = st.columns(3)
         with col1:
             a = st.number_input("Fixed Investment [a] ($)", value=8000.0)
-            c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=120.0)
+            c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0)
         with col2:
-            b = st.number_input("Area Coefficient [b] ($/m²)", value=800.0)
-            c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=10.0)
+            b = st.number_input("Area Coefficient [b] ($/m²)", value=1200.0)
+            c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0)
         with col3:
-            c = st.number_input("Area Exponent [c]", value=0.8, step=0.01)
-    return {"a": a, "b": b, "c": c, "c_hu": c_hu, "c_cu": c_cu}
+            c = st.number_input("Area Exponent [c]", value=0.6, step=0.01)
+            # New Annual Factor Input
+            ann_f = st.number_input("Annual Factor", value=0.2, step=0.01)
+            
+    return {"a": a, "b": b, "c": c, "c_hu": c_hu, "c_cu": c_cu, "annual_factor": ann_f}
 
 def prepare_optimizer_data(df):
     hot_streams = df[df['Type'] == 'Hot'].to_dict('records')
@@ -423,7 +426,8 @@ if st.session_state.get('run_clicked'):
     st.info("The optimization algorithm is DGS-RWCE (Dynamic Generation Strategy with Random Walk). It allows the structure to evolve by adding/removing units dynamically.")
     
     econ_params = render_optimization_inputs()
-    annual_factor = 0.2 # Fixed annualization factor
+    DGS_CONFIG["ANNUAL_FACTOR"] = econ_params["annual_factor"]
+    
     
     col_opt1, col_opt2 = st.columns(2)
     with col_opt1: h_hot_u = st.number_input("Hot Utility h [kW/m²K]", value=1.0) # Updated default
@@ -473,3 +477,4 @@ if st.session_state.get('run_clicked'):
                        data=output.getvalue(), 
                        file_name="HEN_Full_Analysis.xlsx", 
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
