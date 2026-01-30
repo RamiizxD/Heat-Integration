@@ -8,6 +8,7 @@ scipy
 # General installation from GitHub
 outdoor @ git+https://github.com/PKenkel/OUTDOOR.git
 pyomo
+tabulate
 
 
 
