@@ -9,6 +9,8 @@ scipy
 outdoor @ git+https://github.com/PKenkel/OUTDOOR.git
 pyomo
 tabulate
+pydot
+
 
 
 
