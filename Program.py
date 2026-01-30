@@ -1,5 +1,5 @@
 import streamlit as st
-import pd as pd
+import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import copy
@@ -176,3 +176,4 @@ if submitted and not edited_df.empty:
             "No Integration": [f"{base_opex:,.0f}", "0", f"{base_opex:,.0f}"],
             "DGS-RWCE Optimized": [f"{tac_opt * 0.7:,.0f}", f"{tac_opt * 0.3:,.0f}", f"{tac_opt:,.0f}"]
         }))
+
