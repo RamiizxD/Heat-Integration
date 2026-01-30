@@ -53,7 +53,7 @@ def run_thermal_logic(df, dt):
 DGS_CONFIG = {
     "N_HD": 3, "N_CD": 3, "N_FH": 2, "N_FC": 2,
     "DELTA_L": 50.0, "THETA": 1.0, "P_GEN": 0.01,
-    "P_INCENTIVE": 0.005, "MAX_ITER": 100000, "ANNUAL_FACTOR": 0.2
+    "P_INCENTIVE": 0.005, "MAX_ITER": 5000, "ANNUAL_FACTOR": 0.2
 }
 
 def render_optimization_inputs():
@@ -74,6 +74,21 @@ def prepare_optimizer_data(df):
     hot_streams = df[df['Type'] == 'Hot'].to_dict('records')
     cold_streams = df[df['Type'] == 'Cold'].to_dict('records')
     return hot_streams, cold_streams
+
+def prune_and_normalize_matches(matches, streams_data):
+    """
+    Implements the paper's structural logic:
+    1. Removes units with heat load < 10% of the total stream capacity.
+    """
+    pruned_matches = []
+    for m in matches:
+        hs = next(s for s in streams_data if s['Stream'] == m['Hot Stream'])
+        total_q = hs['mCp'] * abs(hs['Ts'] - hs['Tt'])
+        split_ratio = m['Recommended Load [kW]'] / total_q
+        
+        if split_ratio >= 0.10: 
+            pruned_matches.append(m)
+    return pruned_matches
 
 def match_logic_with_splitting(df, pinch_t, side):
     sub = df.copy()
@@ -120,77 +135,76 @@ def find_q_dep(h_stream, c_stream, econ_params, dt_min):
     u_match = calculate_u(h_stream.get('h', 0), c_stream.get('h', 0))
     if u_match <= 0: return None
 
-    q_max_h = h_stream['mCp'] * abs(h_stream['Ts'] - h_stream['Tt'])
-    q_max_c = c_stream['mCp'] * abs(c_stream['Tt'] - c_stream['Ts'])
-    q_limit = min(q_max_h, q_max_c)
+    q_limit = min(h_stream['mCp'] * abs(h_stream['Ts'] - h_stream['Tt']), 
+                  c_stream['mCp'] * abs(c_stream['Tt'] - c_stream['Ts']))
 
     while q_ne < q_limit:
         tho = h_stream['Ts'] - (q_ne / h_stream['mCp'])
         tco = c_stream['Ts'] + (q_ne / c_stream['mCp'])
-        if (h_stream['Ts'] - tco) < dt_min or (tho - c_stream['Ts']) < dt_min: break
+        
+        if (h_stream['Ts'] - tco) < dt_min or (tho - c_stream['Ts']) < dt_min: 
+            break
         
         lmtd = lmtd_chen(h_stream['Ts'], tho, c_stream['Ts'], tco)
         area = q_ne / (u_match * lmtd)
-        annualized_inv = (econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])) * DGS_CONFIG['ANNUAL_FACTOR']
-        savings = q_ne * (econ_params['c_hu'] + econ_params['c_cu'])
-        if (annualized_inv - savings) <= 0: return round(q_ne, 2)
-        q_ne += np.random.uniform(0.5, 1.5) * theta
+        ann_inv = (econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])) * DGS_CONFIG['ANNUAL_FACTOR']
+        util_savings = q_ne * (econ_params['c_hu'] + econ_params['c_cu'])
+        
+        if (ann_inv - util_savings) <= 0: 
+            return round(q_ne, 2)
+        
+        q_ne += np.random.uniform(0.1, 1.0) * theta 
     return None
+
+def calculate_current_tac(matches, hot_streams, cold_streams, econ_params, dt_min):
+    rem_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
+    rem_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
+    total_inv = 0
+    
+    for m in matches:
+        q = m['Recommended Load [kW]']
+        if q <= 0: continue
+        h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
+        c_s = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
+        
+        if q > rem_h[m['Hot Stream']] + 0.1 or q > rem_c[m['Cold Stream']] + 0.1:
+            return float('inf')
+
+        tho = h_s['Ts'] - (q / h_s['mCp'])
+        tco = c_s['Ts'] + (q / c_s['mCp'])
+        if (h_s['Ts'] - tco) < dt_min or (tho - c_s['Ts']) < dt_min: 
+            return float('inf')
+        
+        rem_h[m['Hot Stream']] -= q
+        rem_c[m['Cold Stream']] -= q
+        u = calculate_u(h_s['h'], c_s['h'])
+        lmtd = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
+        area = q / (u * lmtd)
+        total_inv += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
+
+    actual_qh = sum(max(0, val) for val in rem_c.values())
+    actual_qc = sum(max(0, val) for val in rem_h.values())
+    opex = (actual_qh * econ_params['c_hu']) + (actual_qc * econ_params['c_cu'])
+    return opex + (total_inv * DGS_CONFIG['ANNUAL_FACTOR'])
 
 def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, dt_min):
     best_matches = copy.deepcopy(initial_matches)
+    current_tac = calculate_current_tac(best_matches, hot_streams, cold_streams, econ_params, dt_min)
     
-    # --- STREAM HEAT LOAD TRACKING LOGIC ---
-    def calculate_network_tac(matches):
-        rem_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
-        rem_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
-        total_inv = 0
-        
-        for m in matches:
-            q = m['Recommended Load [kW]']
-            if q <= 0: continue
-            
-            h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
-            c_s = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
-            
-            # Constraints: Cannot exchange more than stream availability
-            if q > rem_h[m['Hot Stream']] + 0.1 or q > rem_c[m['Cold Stream']] + 0.1:
-                return float('inf')
-
-            tho = h_s['Ts'] - (q / h_s['mCp'])
-            tco = c_s['Ts'] + (q / c_s['mCp'])
-            
-            if (h_s['Ts'] - tco) < dt_min or (tho - c_s['Ts']) < dt_min: 
-                return float('inf')
-            
-            rem_h[m['Hot Stream']] -= q
-            rem_c[m['Cold Stream']] -= q
-            
-            u = calculate_u(h_s['h'], c_s['h'])
-            lmtd = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
-            area = q / (u * lmtd)
-            total_inv += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
-
-        actual_qh = sum(max(0, val) for val in rem_c.values())
-        actual_qc = sum(max(0, val) for val in rem_h.values())
-        opex = (actual_qh * econ_params['c_hu']) + (actual_qc * econ_params['c_cu'])
-        return opex + (total_inv * DGS_CONFIG['ANNUAL_FACTOR'])
-
-    current_best_score = calculate_network_tac(best_matches)
-    for _ in range(2000):
+    for it in range(DGS_CONFIG['MAX_ITER']):
         if not best_matches: break
         idx = np.random.randint(0, len(best_matches))
-        original_q = best_matches[idx]['Recommended Load [kW]']
+        old_q = best_matches[idx]['Recommended Load [kW]']
         step = np.random.uniform(-1, 1) * DGS_CONFIG['DELTA_L']
-        best_matches[idx]['Recommended Load [kW]'] = max(0.0, original_q + step)
+        best_matches[idx]['Recommended Load [kW]'] = max(0.0, old_q + step)
         
-        new_score = calculate_network_tac(best_matches)
-        if new_score < current_best_score:
-            current_best_score = new_score
+        new_tac = calculate_current_tac(best_matches, hot_streams, cold_streams, econ_params, dt_min)
+        if new_tac < current_tac:
+            current_tac = new_tac
         else:
-            best_matches[idx]['Recommended Load [kW]'] = original_q
+            best_matches[idx]['Recommended Load [kW]'] = old_q
             
-    return [m for m in best_matches if m['Recommended Load [kW]'] > 0.1], current_best_score
+    return [m for m in best_matches if m['Recommended Load [kW]'] > 0], current_tac
 
 # --- UI LOGIC ---
 st.subheader("1. Stream Data Input")
@@ -244,9 +258,8 @@ if st.session_state.get('run_clicked'):
 
     econ_params = render_optimization_inputs() 
     
-    # MER Baseline Calc
     total_mer_q = sum(m['Duty [kW]'] for m in match_summary)
-    area_mer = total_mer_q / (0.5 * 20.0) # Estimated
+    area_mer = total_mer_q / (0.5 * 20.0)
     cap_mer = econ_params['a'] + econ_params['b'] * (area_mer ** econ_params['c'])
     ann_cap_mer = cap_mer * DGS_CONFIG['ANNUAL_FACTOR']
     opex_mer = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
@@ -271,7 +284,6 @@ if st.session_state.get('run_clicked'):
         hot_streams, cold_streams = prepare_optimizer_data(edited_df)
         found_matches = []
         
-        # Search for feasible pairings
         for hs in hot_streams:
             for cs in cold_streams:
                 q_dep = find_q_dep(hs, cs, econ_params, dt_min_input)
@@ -286,17 +298,17 @@ if st.session_state.get('run_clicked'):
                 refined_matches, tac_opt = run_random_walk(found_matches, hot_streams, cold_streams, econ_params, dt_min_input)
                 status.update(label="Evolution Complete!", state="complete", expanded=False)
             
-            # --- FINAL CALCULATION & FORMATTING ---
+            # Apply Pruning from Paper Logic
+            refined_matches = prune_and_normalize_matches(refined_matches, hot_streams)
+            
             display_matches = []
             final_cap = 0
-            rem_h_final = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
             
             for m in refined_matches:
                 q = m['Recommended Load [kW]']
                 hs = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
                 cs = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
                 
-                # Split ratio calc
                 ratio = q / (hs['mCp'] * abs(hs['Ts'] - hs['Tt']))
                 ratio_text = f"{round(ratio, 2)} " if ratio < 0.99 else ""
                 
@@ -314,7 +326,8 @@ if st.session_state.get('run_clicked'):
                 })
 
             ann_cap_opt = final_cap * DGS_CONFIG['ANNUAL_FACTOR']
-            actual_qh_opt = max(0, total_q_h_base - sum(m['Recommended Load [kW]'] for m in refined_matches)) # Approx for summary
+            # Recalculate true tac after pruning
+            tac_opt = calculate_current_tac(refined_matches, hot_streams, cold_streams, econ_params, dt_min_input)
             opex_opt = tac_opt - ann_cap_opt
 
             st.dataframe(pd.DataFrame(display_matches), use_container_width=True)
