@@ -1,16 +1,13 @@
 streamlit
-pygad
 pandas
 numpy
 plotly
 openpyxl
 scipy
-# General installation from GitHub
-outdoor @ git+https://github.com/PKenkel/OUTDOOR.git
+pygad
 pyomo
 tabulate
 pydot
 
-
-
-
+# Install OUTDOOR from GitHub
+outdoor @ git+https://github.com/PKenkel/OUTDOOR.git
