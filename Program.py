@@ -206,7 +206,8 @@ def match_logic_with_splitting(df, pinch_t, side):
                 matches.append({
                     "Match": match_str, 
                     "Duty [kW]": round(m_q, 2), 
-                    "Type": "Split" if is_split or (0 < h_ratio < 0.99) else "Direct"
+                    "Type": "Split" if is_split or (0 < h_ratio < 0.99) else "Direct",
+                    "Side": side  # Tag which side of pinch this match belongs to
                 })
             else:
                 # Skip this match if split ratio is too small
@@ -399,28 +400,43 @@ def calculate_no_integration_costs(df, econ_params):
         'qc': qc_total
     }
 
-def calculate_mer_capital_properly(match_summary, processed_df, econ_params):
+def calculate_mer_capital_properly(match_summary, processed_df, econ_params, pinch_t, dt_min):
     """
-    Calculate MER capital cost using actual U and LMTD for each match
+    Calculate MER capital cost treating Above/Below pinch as separate systems.
     
-    IMPORTANT: Uses ORIGINAL temperatures (Ts, Tt) not shifted (S_Ts, S_Tt)
-    for LMTD calculation to ensure fair comparison with GA optimization.
+    CRITICAL FIX: This function now correctly handles stream splitting at the pinch.
     
-    The shifted temperatures are only used for:
-    1. Pinch analysis (finding minimum utilities)
-    2. MER matching logic (determining feasible matches)
+    The Problem:
+    - In Pinch Analysis, streams are split into "Above Pinch" and "Below Pinch" segments
+    - A stream going from 500°C to 300°C with pinch at 400°C becomes TWO segments:
+      * Above: 500°C → 400°C
+      * Below: 400°C → 300°C
     
-    But for economic calculations (capital cost), both MER and GA should
-    use the same temperature basis (original temps) for fair comparison.
+    The Bug (Before):
+    - Used global supply temps (Ts) for ALL matches
+    - For "Below Pinch" matches, this created temperature crosses
+    - LMTD became tiny (0.001) → huge areas → 4x inflated capital cost
+    
+    The Fix (Now):
+    - Above Pinch: Hot uses Ts, Cold starts at Pinch
+    - Below Pinch: Hot starts at Pinch, Cold uses Ts
+    - This prevents temperature crosses and gives correct LMTD
     """
     cap_mer = 0
     h_factor = econ_params.get('h_factor', 1.0)
+    
+    # Define Real (Non-Shifted) Pinch Temperatures
+    # Based on shift logic: Hot unshifted, Cold shifted +dt
+    pinch_real_hot = pinch_t
+    pinch_real_cold = pinch_t - dt_min
     
     for m in match_summary:
         duty = m['Duty [kW]']
         if duty <= 0:
             continue
             
+        side = m.get('Side', 'Above')  # Default to Above if tag missing
+        
         # Extract stream numbers from match string
         match_str = m['Match']
         # Remove ratio prefix if present
@@ -439,28 +455,41 @@ def calculate_mer_capital_properly(match_summary, processed_df, econ_params):
             
             for _, row in processed_df.iterrows():
                 if str(row['Stream']) == h_stream_id and row['Type'] == 'Hot':
-                    h_stream = row
+                    h_stream = row.to_dict()
                 if str(row['Stream']) == c_stream_id and row['Type'] == 'Cold':
-                    c_stream = row
+                    c_stream = row.to_dict()
             
             if h_stream is not None and c_stream is not None:
-                # Calculate actual U for this match
-                u = calculate_u(h_stream['h'], c_stream['h'], h_factor)
+                # --- CRITICAL FIX: CLAMP START TEMPERATURES BASED ON PINCH SIDE ---
+                # Determine effective Inlet Temperatures for THIS specific match
                 
-                if u > 0:
-                    # Calculate outlet temperatures using ORIGINAL temperatures (Ts, Tt)
-                    # NOT shifted temperatures (S_Ts, S_Tt) - for fair comparison with GA
-                    tho = h_stream['Ts'] - (duty / h_stream['mCp'])
-                    tco = c_stream['Ts'] + (duty / c_stream['mCp'])
+                if side == 'Above':
+                    # ABOVE PINCH:
+                    # Hot Stream: Comes from Supply, goes to Pinch. Start = Original Ts.
+                    # Cold Stream: Comes from Pinch, goes to Target. Start = Pinch Temp.
+                    thi = h_stream['Ts']
+                    tci = max(c_stream['Ts'], pinch_real_cold)
+                else:
+                    # BELOW PINCH:
+                    # Hot Stream: Comes from Pinch, goes to Target. Start = Pinch Temp.
+                    # Cold Stream: Comes from Supply, goes to Pinch. Start = Original Ts.
+                    thi = min(h_stream['Ts'], pinch_real_hot)
+                    tci = c_stream['Ts']
+                
+                # Calculate Outlet Temperatures based on Duty and CORRECTED Inlets
+                tho = thi - (duty / h_stream['mCp'])
+                tco = tci + (duty / c_stream['mCp'])
+                
+                # Calculate U and LMTD
+                u = calculate_u(h_stream['h'], c_stream['h'], h_factor)
+                lmtd = lmtd_chen(thi, tho, tci, tco)
+                
+                if u > 0 and lmtd > 0:
+                    area = duty / (u * lmtd)
+                    cap_mer += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
                     
-                    # Calculate LMTD using Chen approximation with ORIGINAL temps
-                    lmtd = lmtd_chen(h_stream['Ts'], tho, c_stream['Ts'], tco)
-                    
-                    if lmtd > 0:
-                        area = duty / (u * lmtd)
-                        cap_mer += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
-        except:
-            # If parsing fails, skip this match
+        except Exception as e:
+            # Skip invalid matches
             continue
     
     return cap_mer
@@ -586,8 +615,8 @@ if st.session_state.get('run_clicked'):
                         else:
                             st.success("✓ U value in reasonable range for industrial heat exchangers") 
         
-        # MER Economics Calculation
-        cap_mer = calculate_mer_capital_properly(match_summary, processed_df, econ_params)
+        # MER Economics Calculation - Now with correct pinch splitting
+        cap_mer = calculate_mer_capital_properly(match_summary, processed_df, econ_params, pinch, dt_min_input)
         ann_cap_mer = cap_mer * 0.2
         opex_mer = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
         tac_mer = opex_mer + ann_cap_mer
