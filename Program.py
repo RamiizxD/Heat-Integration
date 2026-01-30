@@ -15,11 +15,20 @@ This application performs **Pinch Analysis**, **MER Matching with Stream Splitti
 st.markdown("---")
 
 # --- CORE MATH FUNCTIONS ---
-def calculate_u(h1, h2):
-    """Calculate overall heat transfer coefficient"""
+def calculate_u(h1, h2, h_unit_factor=1.0):
+    """
+    Calculate overall heat transfer coefficient
+    
+    h_unit_factor: Conversion factor for h values
+    - If h is in kW/m²K: use 1.0
+    - If h is in W/m²K: use 0.001
+    - If your h values seem too high (like 1.6): try 0.1
+    """
     if h1 <= 0 or h2 <= 0:
         return 0
-    return 1 / ((1/h1) + (1/h2))
+    h1_converted = h1 * h_unit_factor
+    h2_converted = h2 * h_unit_factor
+    return 1 / ((1/h1_converted) + (1/h2_converted))
 
 def lmtd_chen(t1, t2, t3, t4):
     """
@@ -112,6 +121,24 @@ def render_optimization_inputs():
         with col3:
             c = st.number_input("Area Exponent [c]", value=0.6, step=0.01)
     
+    with st.expander("⚠️ Heat Transfer Coefficient Units Correction", expanded=True):
+        st.warning("""
+        **Important**: If your h values seem unusually high (like 1.6) and capital costs are too low,
+        you may need to apply a unit conversion factor.
+        """)
+        h_factor = st.selectbox(
+            "h value unit conversion factor",
+            options=[1.0, 0.1, 0.01, 0.001],
+            index=1,  # Default to 0.1
+            help="""
+            - 1.0 = h already in kW/m²K (typical range 0.1-0.5)
+            - 0.1 = h needs scaling down by 10x (use if h values are 1-5)
+            - 0.01 = h in 100× units
+            - 0.001 = h in W/m²K (convert to kW/m²K)
+            """
+        )
+        st.info(f"Current setting: h values will be multiplied by {h_factor}")
+    
     with st.expander("Genetic Algorithm Settings", expanded=False):
         ga_col1, ga_col2 = st.columns(2)
         with ga_col1:
@@ -126,7 +153,7 @@ def render_optimization_inputs():
         GA_CONFIG["num_parents_mating"] = num_parents
         GA_CONFIG["mutation_percent_genes"] = mutation_rate
     
-    return {"a": a, "b": b, "c": c, "c_hu": c_hu, "c_cu": c_cu}
+    return {"a": a, "b": b, "c": c, "c_hu": c_hu, "c_cu": c_cu, "h_factor": h_factor}
 
 def prepare_optimizer_data(df):
     hot_streams = df[df['Type'] == 'Hot'].to_dict('records')
@@ -226,6 +253,7 @@ def calculate_tac_for_matches(matches, hot_streams, cold_streams, econ_params, d
     rem_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
     rem_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
     total_inv = 0
+    h_factor = econ_params.get('h_factor', 1.0)
     
     for m in matches:
         q = m['Recommended Load [kW]']
@@ -252,7 +280,7 @@ def calculate_tac_for_matches(matches, hot_streams, cold_streams, econ_params, d
         rem_c[m['Cold Stream']] -= q
         
         # Calculate area and investment
-        u = calculate_u(h_s['h'], c_s['h'])
+        u = calculate_u(h_s['h'], c_s['h'], h_factor)
         if u <= 0:
             return float('inf')
             
@@ -374,8 +402,19 @@ def calculate_no_integration_costs(df, econ_params):
 def calculate_mer_capital_properly(match_summary, processed_df, econ_params):
     """
     Calculate MER capital cost using actual U and LMTD for each match
+    
+    IMPORTANT: Uses ORIGINAL temperatures (Ts, Tt) not shifted (S_Ts, S_Tt)
+    for LMTD calculation to ensure fair comparison with GA optimization.
+    
+    The shifted temperatures are only used for:
+    1. Pinch analysis (finding minimum utilities)
+    2. MER matching logic (determining feasible matches)
+    
+    But for economic calculations (capital cost), both MER and GA should
+    use the same temperature basis (original temps) for fair comparison.
     """
     cap_mer = 0
+    h_factor = econ_params.get('h_factor', 1.0)
     
     for m in match_summary:
         duty = m['Duty [kW]']
@@ -406,15 +445,16 @@ def calculate_mer_capital_properly(match_summary, processed_df, econ_params):
             
             if h_stream is not None and c_stream is not None:
                 # Calculate actual U for this match
-                u = calculate_u(h_stream['h'], c_stream['h'])
+                u = calculate_u(h_stream['h'], c_stream['h'], h_factor)
                 
                 if u > 0:
-                    # Calculate outlet temperatures
-                    tho = h_stream['S_Ts'] - (duty / h_stream['mCp'])
-                    tco = c_stream['S_Ts'] + (duty / c_stream['mCp'])
+                    # Calculate outlet temperatures using ORIGINAL temperatures (Ts, Tt)
+                    # NOT shifted temperatures (S_Ts, S_Tt) - for fair comparison with GA
+                    tho = h_stream['Ts'] - (duty / h_stream['mCp'])
+                    tco = c_stream['Ts'] + (duty / c_stream['mCp'])
                     
-                    # Calculate LMTD using Chen approximation
-                    lmtd = lmtd_chen(h_stream['S_Ts'], tho, c_stream['S_Ts'], tco)
+                    # Calculate LMTD using Chen approximation with ORIGINAL temps
+                    lmtd = lmtd_chen(h_stream['Ts'], tho, c_stream['Ts'], tco)
                     
                     if lmtd > 0:
                         area = duty / (u * lmtd)
@@ -510,6 +550,42 @@ if st.session_state.get('run_clicked'):
 
         econ_params = render_optimization_inputs() 
         
+        # Add diagnostic information
+        if edited_df is not None and len(edited_df) > 0:
+            with st.expander("🔍 Heat Transfer Diagnostics", expanded=False):
+                st.write("**Current h values and calculated U:**")
+                h_factor = econ_params.get('h_factor', 1.0)
+                
+                diag_data = []
+                for idx, row in edited_df.iterrows():
+                    h_val = row['h']
+                    h_corrected = h_val * h_factor
+                    diag_data.append({
+                        "Stream": row['Stream'],
+                        "Original h": h_val,
+                        "Corrected h": h_corrected,
+                        "Unit": "kW/m²K"
+                    })
+                
+                st.dataframe(pd.DataFrame(diag_data), use_container_width=True)
+                
+                # Calculate sample U values
+                if len(edited_df) >= 2:
+                    st.write("**Sample U values for stream pairs:**")
+                    hot = edited_df[edited_df['Type'] == 'Hot'].iloc[0] if len(edited_df[edited_df['Type'] == 'Hot']) > 0 else None
+                    cold = edited_df[edited_df['Type'] == 'Cold'].iloc[0] if len(edited_df[edited_df['Type'] == 'Cold']) > 0 else None
+                    
+                    if hot is not None and cold is not None:
+                        u_sample = calculate_u(hot['h'], cold['h'], h_factor)
+                        st.metric("Example U (process-to-process)", f"{u_sample:.4f} kW/m²K")
+                        
+                        if u_sample > 0.5:
+                            st.error("⚠️ U value seems too HIGH! Typical process U values are 0.05-0.3 kW/m²K. Try a smaller h_factor!")
+                        elif u_sample < 0.01:
+                            st.warning("⚠️ U value seems too LOW! Try a larger h_factor.")
+                        else:
+                            st.success("✓ U value in reasonable range for industrial heat exchangers") 
+        
         # MER Economics Calculation
         cap_mer = calculate_mer_capital_properly(match_summary, processed_df, econ_params)
         ann_cap_mer = cap_mer * 0.2
@@ -562,7 +638,7 @@ if st.session_state.get('run_clicked'):
                     ratio = q / (hs['mCp'] * abs(hs['Ts'] - hs['Tt']))
                     ratio_text = f"{round(ratio, 2)} " if ratio < 0.99 else ""
                     
-                    u = calculate_u(hs['h'], cs['h'])
+                    u = calculate_u(hs['h'], cs['h'], econ_params['h_factor'])
                     tho = hs['Ts'] - (q / hs['mCp'])
                     tco = cs['Ts'] + (q / cs['mCp'])
                     l_val = lmtd_chen(hs['Ts'], tho, cs['Ts'], tco)
