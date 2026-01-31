@@ -3,8 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import io
-import pygad
-import outdoor
+import copy
 
 # --- CONFIGURATION & UI SETUP ---
 st.set_page_config(page_title="Process Heat Integration Tool", layout="wide")
@@ -18,18 +17,20 @@ st.markdown("---")
 
 # --- CORE MATH FUNCTIONS ---
 def calculate_u(h1, h2):
+    if h1 <= 0 or h2 <= 0:
+        return 0
     return 1 / ((1/h1) + (1/h2))
 
 def lmtd_chen(t1, t2, t3, t4):
-    theta1 = max(abs(t1 - t4), 0.01)
-    theta2 = max(abs(t2 - t3), 0.01)
+    theta1 = max(t1 - t4, 0.001) 
+    theta2 = max(t2 - t3, 0.001)
+    if abs(theta1 - theta2) < 0.01: return theta1
     return (theta1 * theta2 * (theta1 + theta2) / 2)**(1/3)
 
 def run_thermal_logic(df, dt):
     df = df.copy()
     df[['mCp', 'Ts', 'Tt']] = df[['mCp', 'Ts', 'Tt']].apply(pd.to_numeric)
     
-    # Temperature Shifting: Cold is shifted UP by dt
     df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'], df['Ts'] + dt)
     df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
     
@@ -47,6 +48,47 @@ def run_thermal_logic(df, dt):
     pinch_t = temps[feasible.index(0)] if 0 in feasible else None
     
     return qh_min, feasible[-1], pinch_t, temps, feasible, df
+
+# --- DGS-RWCE ALGORITHM & ECONOMIC INPUTS ---
+DGS_CONFIG = {
+    "N_HD": 3, "N_CD": 3, "N_FH": 2, "N_FC": 2,
+    "DELTA_L": 50.0, "THETA": 1.0, "P_GEN": 0.01,
+    "P_INCENTIVE": 0.005, "MAX_ITER": 5000, "ANNUAL_FACTOR": 0.2
+}
+
+def render_optimization_inputs():
+    st.markdown("### 4. Optimization & Economics Parameters")
+    with st.expander("Economic Coefficients (Plant Specific)", expanded=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            a = st.number_input("Fixed Investment [a] ($)", value=8000.0)
+            c_hu = st.number_input("Hot Utility Cost ($/kW·yr)", value=80.0)
+        with col2:
+            b = st.number_input("Area Coefficient [b] ($/m²)", value=1200.0)
+            c_cu = st.number_input("Cold Utility Cost ($/kW·yr)", value=20.0)
+        with col3:
+            c = st.number_input("Area Exponent [c]", value=0.6, step=0.01)
+    return {"a": a, "b": b, "c": c, "c_hu": c_hu, "c_cu": c_cu}
+
+def prepare_optimizer_data(df):
+    hot_streams = df[df['Type'] == 'Hot'].to_dict('records')
+    cold_streams = df[df['Type'] == 'Cold'].to_dict('records')
+    return hot_streams, cold_streams
+
+def prune_and_normalize_matches(matches, streams_data):
+    """
+    Implements the paper's structural logic:
+    1. Removes units with heat load < 10% of the total stream capacity.
+    """
+    pruned_matches = []
+    for m in matches:
+        hs = next(s for s in streams_data if s['Stream'] == m['Hot Stream'])
+        total_q = hs['mCp'] * abs(hs['Ts'] - hs['Tt'])
+        split_ratio = m['Recommended Load [kW]'] / total_q
+        
+        if split_ratio >= 0.10: 
+            pruned_matches.append(m)
+    return pruned_matches
 
 def match_logic_with_splitting(df, pinch_t, side):
     sub = df.copy()
@@ -67,18 +109,15 @@ def match_logic_with_splitting(df, pinch_t, side):
     while any(h['Q'] > 1 for h in hot) and any(c['Q'] > 1 for c in cold):
         h = next(s for s in hot if s['Q'] > 1)
         c = next((s for s in cold if (s['mCp'] >= h['mCp'] if side=='Above' else h['mCp'] >= s['mCp']) and s['Q'] > 1), None)
-        
         is_split = False
         if not c:
             c = next((s for s in cold if s['Q'] > 1), None)
             is_split = True
-            
         if c:
             m_q = min(h['Q'], c['Q'])
             h_ratio = m_q / total_duties[h['Stream']] if total_duties[h['Stream']] > 0 else 0
             ratio_text = f"{round(h_ratio, 2)} " if h_ratio < 0.99 else ""
             match_str = f"{ratio_text}Stream {h['Stream']} ↔ {c['Stream']}"
-            
             h['Q'] -= m_q
             c['Q'] -= m_q
             matches.append({
@@ -90,7 +129,84 @@ def match_logic_with_splitting(df, pinch_t, side):
             break
     return matches, hot, cold
 
-# --- SECTION 1: DATA INPUT & EXCEL IMPORT ---
+def find_q_dep(h_stream, c_stream, econ_params, dt_min):
+    q_ne = 1.0
+    theta = DGS_CONFIG["THETA"]
+    u_match = calculate_u(h_stream.get('h', 0), c_stream.get('h', 0))
+    if u_match <= 0: return None
+
+    q_limit = min(h_stream['mCp'] * abs(h_stream['Ts'] - h_stream['Tt']), 
+                  c_stream['mCp'] * abs(c_stream['Tt'] - c_stream['Ts']))
+
+    while q_ne < q_limit:
+        tho = h_stream['Ts'] - (q_ne / h_stream['mCp'])
+        tco = c_stream['Ts'] + (q_ne / c_stream['mCp'])
+        
+        if (h_stream['Ts'] - tco) < dt_min or (tho - c_stream['Ts']) < dt_min: 
+            break
+        
+        lmtd = lmtd_chen(h_stream['Ts'], tho, c_stream['Ts'], tco)
+        area = q_ne / (u_match * lmtd)
+        ann_inv = (econ_params['a'] + econ_params['b'] * (area ** econ_params['c'])) * DGS_CONFIG['ANNUAL_FACTOR']
+        util_savings = q_ne * (econ_params['c_hu'] + econ_params['c_cu'])
+        
+        if (ann_inv - util_savings) <= 0: 
+            return round(q_ne, 2)
+        
+        q_ne += np.random.uniform(0.1, 1.0) * theta 
+    return None
+
+def calculate_current_tac(matches, hot_streams, cold_streams, econ_params, dt_min):
+    rem_h = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in hot_streams}
+    rem_c = {s['Stream']: s['mCp'] * abs(s['Ts'] - s['Tt']) for s in cold_streams}
+    total_inv = 0
+    
+    for m in matches:
+        q = m['Recommended Load [kW]']
+        if q <= 0: continue
+        h_s = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
+        c_s = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
+        
+        if q > rem_h[m['Hot Stream']] + 0.1 or q > rem_c[m['Cold Stream']] + 0.1:
+            return float('inf')
+
+        tho = h_s['Ts'] - (q / h_s['mCp'])
+        tco = c_s['Ts'] + (q / c_s['mCp'])
+        if (h_s['Ts'] - tco) < dt_min or (tho - c_s['Ts']) < dt_min: 
+            return float('inf')
+        
+        rem_h[m['Hot Stream']] -= q
+        rem_c[m['Cold Stream']] -= q
+        u = calculate_u(h_s['h'], c_s['h'])
+        lmtd = lmtd_chen(h_s['Ts'], tho, c_s['Ts'], tco)
+        area = q / (u * lmtd)
+        total_inv += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
+
+    actual_qh = sum(max(0, val) for val in rem_c.values())
+    actual_qc = sum(max(0, val) for val in rem_h.values())
+    opex = (actual_qh * econ_params['c_hu']) + (actual_qc * econ_params['c_cu'])
+    return opex + (total_inv * DGS_CONFIG['ANNUAL_FACTOR'])
+
+def run_random_walk(initial_matches, hot_streams, cold_streams, econ_params, dt_min):
+    best_matches = copy.deepcopy(initial_matches)
+    current_tac = calculate_current_tac(best_matches, hot_streams, cold_streams, econ_params, dt_min)
+    
+    for it in range(DGS_CONFIG['MAX_ITER']):
+        if not best_matches: break
+        idx = np.random.randint(0, len(best_matches))
+        old_q = best_matches[idx]['Recommended Load [kW]']
+        step = np.random.uniform(-1, 1) * DGS_CONFIG['DELTA_L']
+        best_matches[idx]['Recommended Load [kW]'] = max(0.0, old_q + step)
+        
+        new_tac = calculate_current_tac(best_matches, hot_streams, cold_streams, econ_params, dt_min)
+        if new_tac < current_tac:
+            current_tac = new_tac
+        else:
+            best_matches[idx]['Recommended Load [kW]'] = old_q
+            
+    return [m for m in best_matches if m['Recommended Load [kW]'] > 0], current_tac
+
+# --- UI LOGIC ---
 st.subheader("1. Stream Data Input")
 uploaded_file = st.file_uploader("Import Stream Data from Excel (.xlsx)", type=["xlsx"])
 if uploaded_file:
@@ -112,7 +228,6 @@ with st.form("main_input_form"):
 if submit_thermal and not edited_df.empty:
     st.session_state.run_clicked = True
 
-# --- MAIN OUTPUT DISPLAY ---
 if st.session_state.get('run_clicked'):
     qh, qc, pinch, t_plot, q_plot, processed_df = run_thermal_logic(edited_df, dt_min_input)
     
@@ -122,8 +237,7 @@ if st.session_state.get('run_clicked'):
     with r1:
         st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
         st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
-        st.metric("Pinch Temperature (Hot)", f"{pinch} °C" if pinch is not None else "N/A")
-        st.metric("Pinch Temperature (Cold)", f"{pinch - dt_min_input} °C" if pinch is not None else "N/A")
+        st.metric("Pinch Temperature", f"{pinch} °C" if pinch is not None else "N/A")
     with r2:
         fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="GCC"))
         fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
@@ -131,7 +245,6 @@ if st.session_state.get('run_clicked'):
 
     st.markdown("---")
     st.subheader("3. Heat Exchanger Network Matching (MER)")
-    
     match_summary = []
     if pinch is not None:
         l, r = st.columns(2)
@@ -140,51 +253,97 @@ if st.session_state.get('run_clicked'):
             match_summary.extend(matches)
             with (l if i == 0 else r):
                 st.write(f"**Matches {side} Pinch**")
-                if matches:
-                    st.dataframe(pd.DataFrame(matches), use_container_width=True)
-                else:
-                    st.info("No internal matches possible.")
-                for c in c_rem: 
-                    if c['Q'] > 1: st.error(f"Required Heater: {c['Stream']} ({c['Q']:,.1f} kW)")
-                for h in h_rem: 
-                    if h['Q'] > 1: st.info(f"Required Cooler: {h['Stream']} ({h['Q']:,.1f} kW)")
+                if matches: st.dataframe(pd.DataFrame(matches), use_container_width=True)
+                else: st.info("No internal matches possible.")
+
+    econ_params = render_optimization_inputs() 
     
+    total_mer_q = sum(m['Duty [kW]'] for m in match_summary)
+    area_mer = total_mer_q / (0.5 * 20.0)
+    cap_mer = econ_params['a'] + econ_params['b'] * (area_mer ** econ_params['c'])
+    ann_cap_mer = cap_mer * DGS_CONFIG['ANNUAL_FACTOR']
+    opex_mer = (qh * econ_params['c_hu']) + (qc * econ_params['c_cu'])
+    tac_mer = opex_mer + ann_cap_mer
+
+    st.markdown("#### MER Economic Breakdown")
+    m_col1, m_col2, m_col3 = st.columns(3)
+    m_col1.metric("Capital Cost", f"${cap_mer:,.2f}", f"(${ann_cap_mer:,.2f}/yr)")
+    m_col2.metric("Annual Operating Cost", f"${opex_mer:,.2f}/yr")
+    m_col3.metric("Total Annual Cost (TAC)", f"${tac_mer:,.2f}/yr")
+
     st.markdown("---")
-    st.subheader("4. Optimization and Economic Analysis (Under development..)")
-    
+    st.subheader("4. Optimization and Economic Analysis")
     col_opt1, col_opt2 = st.columns(2)
-    with col_opt1:
-        h_hot_u = st.number_input("Hot Utility h [kW/m²K]", value=5.0)
-    with col_opt2:
-        h_cold_u = st.number_input("Cold Utility h [kW/m²K]", value=0.8)
+    with col_opt1: h_hot_u = st.number_input("Hot Utility h [kW/m²K]", value=5.0)
+    with col_opt2: h_cold_u = st.number_input("Cold Utility h [kW/m²K]", value=0.8)
+
+    total_q_h_base = edited_df[edited_df['Type']=='Cold'].apply(lambda x: x['mCp']*abs(x['Ts']-x['Tt']), axis=1).sum()
+    total_q_c_base = edited_df[edited_df['Type']=='Hot'].apply(lambda x: x['mCp']*abs(x['Ts']-x['Tt']), axis=1).sum()
 
     if st.button("Calculate Economic Optimum"):
-        # Economics calculation using Equation 05 constants
-        avg_h_h, avg_h_c = edited_df[edited_df['Type']=='Hot']['h'].mean(), edited_df[edited_df['Type']=='Cold']['h'].mean()
-        U_h, U_c = calculate_u(h_hot_u, avg_h_c), calculate_u(h_cold_u, avg_h_h)
-        lmtd = lmtd_chen(processed_df['Ts'].max(), processed_df['Tt'].min(), processed_df['Ts'].min(), processed_df['Tt'].max())
+        hot_streams, cold_streams = prepare_optimizer_data(edited_df)
+        found_matches = []
         
-        opt_area = (qh / (U_h * lmtd)) + (qc / (U_c * lmtd))
-        cap_inv = 8000 + 433.3 * (opt_area ** 0.6)
-        tac = (qh * 0.05 + qc * 0.01) * 8000 + (cap_inv / 5)
+        for hs in hot_streams:
+            for cs in cold_streams:
+                q_dep = find_q_dep(hs, cs, econ_params, dt_min_input)
+                if q_dep:
+                    found_matches.append({
+                        "Hot Stream": hs['Stream'], "Cold Stream": cs['Stream'],
+                        "Recommended Load [kW]": q_dep
+                    })
         
-        st.markdown("#### NLP Optimization Economic Breakdown")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Optimized Total Area", f"{opt_area:,.2f} m²")
-        m2.metric("Total Capital Investment", f"${cap_inv:,.2f}")
-        m3.metric("Total Annual Cost (TAC)", f"${tac:,.2f}")
+        if found_matches:
+            with st.status("Evolving Network via Random Walk...", expanded=True) as status:
+                refined_matches, tac_opt = run_random_walk(found_matches, hot_streams, cold_streams, econ_params, dt_min_input)
+                status.update(label="Evolution Complete!", state="complete", expanded=False)
+            
+            # Apply Pruning from Paper Logic
+            refined_matches = prune_and_normalize_matches(refined_matches, hot_streams)
+            
+            display_matches = []
+            final_cap = 0
+            
+            for m in refined_matches:
+                q = m['Recommended Load [kW]']
+                hs = next(s for s in hot_streams if s['Stream'] == m['Hot Stream'])
+                cs = next(s for s in cold_streams if s['Stream'] == m['Cold Stream'])
+                
+                ratio = q / (hs['mCp'] * abs(hs['Ts'] - hs['Tt']))
+                ratio_text = f"{round(ratio, 2)} " if ratio < 0.99 else ""
+                
+                u = calculate_u(hs['h'], cs['h'])
+                tho = hs['Ts'] - (q / hs['mCp'])
+                tco = cs['Ts'] + (q / cs['mCp'])
+                l_val = lmtd_chen(hs['Ts'], tho, cs['Ts'], tco)
+                area = q / (u * l_val)
+                final_cap += (econ_params['a'] + econ_params['b'] * (area ** econ_params['c']))
+                
+                display_matches.append({
+                    "Match": f"{ratio_text}Stream {hs['Stream']} ↔ {cs['Stream']}",
+                    "Duty [kW]": round(q, 2),
+                    "Area [m²]": round(area, 2)
+                })
 
-    # --- FINAL EXPORT SECTION ---
-    st.markdown("---")
-    st.subheader("5. Export Results")
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Save Match results
-        if match_summary:
-            pd.DataFrame(match_summary).to_excel(writer, sheet_name='HEN_Matches', index=False)
-        # Save input data for reference
-        edited_df.to_excel(writer, sheet_name='Input_Data', index=False)
-        # Save Pinch metrics
-        pd.DataFrame({"Metric": ["Qh", "Qc", "Pinch Hot", "Pinch Cold"], "Value": [qh, qc, pinch, pinch-dt_min_input]}).to_excel(writer, sheet_name='Pinch_Summary', index=False)
-    
-    st.download_button(label="📥 Download HEN Report (Excel)", data=output.getvalue(), file_name="HEN_Full_Analysis.xlsx", mime="application/vnd.ms-excel")
+            ann_cap_opt = final_cap * DGS_CONFIG['ANNUAL_FACTOR']
+            # Recalculate true tac after pruning
+            tac_opt = calculate_current_tac(refined_matches, hot_streams, cold_streams, econ_params, dt_min_input)
+            opex_opt = tac_opt - ann_cap_opt
+
+            st.dataframe(pd.DataFrame(display_matches), use_container_width=True)
+
+            o_col1, o_col2, o_col3 = st.columns(3)
+            o_col1.metric("Capital Cost", f"${final_cap:,.2f}", f"(${ann_cap_opt:,.2f}/yr)")
+            o_col2.metric("Annual Operating Cost", f"${opex_opt:,.2f}/yr")
+            o_col3.metric("Total Annual Cost (TAC)", f"${tac_opt:,.2f}/yr")
+
+            st.markdown("---")
+            st.subheader("5. Comparison")
+            opex_no_int = (total_q_h_base * econ_params['c_hu']) + (total_q_c_base * econ_params['c_cu'])
+            comparison_df = pd.DataFrame({
+                "Metric": ["Capital Cost ($)", "Operating Cost ($/yr)", "TAC ($/yr)"],
+                "No Integration": ["0.00", f"{opex_no_int:,.2f}", f"{opex_no_int:,.2f}"],
+                "MER Setup": [f"{cap_mer:,.2f}", f"{opex_mer:,.2f}", f"{tac_mer:,.2f}"],
+                "Optimized": [f"{final_cap:,.2f}", f"{opex_opt:,.2f}", f"{tac_opt:,.2f}"]
+            })
+            st.table(comparison_df)
