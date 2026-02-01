@@ -152,4 +152,143 @@ def get_composite_curve_points(df, stream_type, start_enthalpy=0):
             # Let's simplify: simply check if interval is within stream bounds
             # Since we sorted temps, we just check overlap
             low, high = min(t_start, t_end), max(t_start, t_end)
-            active = subset[(subset['Ts'] <= low) &
+            active = subset[(subset['Ts'] <= low) & (subset['Tt'] >= high) | 
+                            (subset['Ts'] >= high) & (subset['Tt'] <= low)]
+            delta_t = high - low
+
+        mcp_sum = active['mCp'].sum()
+        delta_h = mcp_sum * delta_t
+        
+        current_H += delta_h
+        
+        T_points.append(t_end)
+        H_points.append(current_H)
+        
+    return T_points, H_points
+
+# --- SECTION 1: DATA INPUT ---
+st.subheader("1. Stream Data Input")
+uploaded_file = st.file_uploader("Import Stream Data from Excel (.xlsx)", type=["xlsx"])
+
+if 'input_data' not in st.session_state:
+    # Default example data
+    st.session_state['input_data'] = pd.DataFrame([
+        [1, 'Hot', 2.0, 150, 60],
+        [2, 'Hot', 1.0, 90, 60],
+        [3, 'Cold', 3.0, 20, 125],
+        [4, 'Cold', 0.5, 25, 100]
+    ], columns=["Stream", "Type", "mCp", "Ts", "Tt"])
+
+if uploaded_file:
+    try:
+        st.session_state['input_data'] = pd.read_excel(uploaded_file)
+        st.success("Data imported!")
+    except Exception as e: st.error(f"Error: {e}")
+
+with st.form("main_input_form"):
+    dt_min_input = st.number_input("Target ΔTmin [°C]", min_value=1.0, value=10.0, step=1.0)
+    edited_df = st.data_editor(st.session_state['input_data'], num_rows="dynamic", use_container_width=True)
+    submit_thermal = st.form_submit_button("Run Thermal Analysis")
+
+if submit_thermal and not edited_df.empty:
+    st.session_state.run_clicked = True
+
+# --- MAIN OUTPUT DISPLAY ---
+if st.session_state.get('run_clicked'):
+    qh_min, qc_min, pinch_s, gcc_t, gcc_q, processed_df = run_thermal_logic(edited_df, dt_min_input)
+    
+    st.markdown("---")
+    st.subheader("2. Pinch Analysis Result")
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Hot Utility (Qh)", f"{qh_min:,.2f} kW")
+    col2.metric("Cold Utility (Qc)", f"{qc_min:,.2f} kW")
+    
+    # Calculate Actual Pinch Temps from Shifted Pinch
+    if pinch_s is not None:
+        p_hot = pinch_s + dt_min_input/2
+        p_cold = pinch_s - dt_min_input/2
+        col3.metric("Pinch Temperature", f"{p_hot:.1f}°C / {p_cold:.1f}°C")
+    else:
+        col3.metric("Pinch Temperature", "None")
+
+    # --- SECTION 3: GRAPHICAL REPRESENTATION ---
+    st.markdown("---")
+    st.subheader("3. Graphical Representation of Heat Loads")
+    
+    g1, g2 = st.columns(2)
+    
+    with g1:
+        st.write("**Composite Curves**")
+        st.caption(f"Cold Curve shifted vertically by Qh_min ({qh_min:.2f} kW) to achieve minimum approach of {dt_min_input}°C.")
+        
+        # 1. Generate Hot Curve Points (Actual T, Cumulative H)
+        h_t, h_h = get_composite_curve_points(edited_df, 'Hot', start_enthalpy=0)
+        
+        # 2. Generate Cold Curve Points (Actual T, Cumulative H)
+        # CRITICAL: Start Enthalpy = Qh_min. This "raises" the curve on the Y-axis.
+        c_t, c_h = get_composite_curve_points(edited_df, 'Cold', start_enthalpy=qh_min)
+        
+        fig_comp = go.Figure()
+        fig_comp.add_trace(go.Scatter(x=h_t, y=h_h, name="Hot Composite", line=dict(color='red', width=3)))
+        fig_comp.add_trace(go.Scatter(x=c_t, y=c_h, name="Cold Composite", line=dict(color='blue', width=3)))
+        
+        fig_comp.update_layout(
+            xaxis_title="Actual Temperature [°C]", 
+            yaxis_title="Enthalpy / Heat Load [kW]",
+            height=500,
+            hovermode="x unified"
+        )
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+    with g2:
+        st.write("**Grand Composite Curve**")
+        st.caption("Shifted Temperature vs. Net Heat Flow")
+        # Ensure T is on X, Q is on Y
+        fig_gcc = go.Figure(go.Scatter(
+            x=gcc_t, y=gcc_q, 
+            mode='lines+markers', 
+            name="GCC", 
+            fill='tozeroy', 
+            line=dict(color='green')
+        ))
+        fig_gcc.update_layout(
+            xaxis_title="Shifted Temperature [°C]", 
+            yaxis_title="Net Heat Flow [kW]",
+            height=500
+        )
+        st.plotly_chart(fig_gcc, use_container_width=True)
+
+    # --- SECTION 4: MATCHING ---
+    st.markdown("---")
+    st.subheader("4. Heat Exchanger Network Matching (MER)")
+    
+    if pinch_s is not None:
+        l, r = st.columns(2)
+        match_summary = []
+        for i, side in enumerate(['Above', 'Below']):
+            matches, h_rem, c_rem = match_logic_with_splitting(processed_df, pinch_s, side)
+            match_summary.extend(matches)
+            
+            with (l if i == 0 else r):
+                st.markdown(f"**Matches {side} Pinch**")
+                if matches:
+                    st.dataframe(pd.DataFrame(matches), use_container_width=True, hide_index=True)
+                else:
+                    st.info("No matches found.")
+                
+                # Show Remaining Duties (Utilities)
+                if c_rem:
+                    for c in c_rem:
+                        if c['Q'] > 1: st.error(f"Heater required: {c['Stream']} ({c['Q']:,.1f} kW)")
+                if h_rem:
+                    for h in h_rem:
+                        if h['Q'] > 1: st.info(f"Cooler required: {h['Stream']} ({h['Q']:,.1f} kW)")
+        
+        # Export Button
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            pd.DataFrame(match_summary).to_excel(writer, sheet_name='Matches', index=False)
+        st.download_button("📥 Download Design", output.getvalue(), "HEN_Design.xlsx")
+    else:
+        st.warning("No Pinch Point detected. The process might be a threshold problem or fully satisfied.")
