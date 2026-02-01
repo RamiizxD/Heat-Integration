@@ -40,7 +40,6 @@ def run_thermal_logic(df, dt):
 
 def match_logic_with_splitting(df, pinch_t, side):
     sub = df.copy()
-    # Logic for matching based on shifted pinch
     if side == 'Above':
         sub['S_Ts'], sub['S_Tt'] = sub['S_Ts'].clip(lower=pinch_t), sub['S_Tt'].clip(lower=pinch_t)
     else:
@@ -57,7 +56,6 @@ def match_logic_with_splitting(df, pinch_t, side):
     
     while any(h['Q'] > 1 for h in hot) and any(c['Q'] > 1 for c in cold):
         h = next(s for s in hot if s['Q'] > 1)
-        # Simplified MER matching rule (mCp comparison)
         c = next((s for s in cold if (s['mCp'] >= h['mCp'] if side=='Above' else h['mCp'] >= s['mCp']) and s['Q'] > 1), None)
         
         is_split = False
@@ -122,35 +120,35 @@ if st.session_state.get('run_clicked'):
     
     with g1:
         st.write("**Composite Curves**")
-        # Logic to build Hot/Cold Composite Curves
         # Hot Composite
         hot_df = edited_df[edited_df['Type'] == 'Hot'].copy()
-        h_temps = sorted(pd.concat([hot_df['Ts'], hot_df['Tt']]).unique(), reverse=True)
+        h_temps = sorted(pd.concat([hot_df['Ts'], hot_df['Tt']]).unique())
         h_q = [0]
         for i in range(len(h_temps)-1):
-            hi, lo = h_temps[i], h_temps[i+1]
-            mcp_sum = hot_df[(hot_df['Ts'] >= hi) & (hot_df['Tt'] <= lo)]['mCp'].sum()
+            lo, hi = h_temps[i], h_temps[i+1]
+            mcp_sum = hot_df[(hot_df['Ts'] >= hi) & (hot_df['Tt'] <= lo) | (hot_df['Ts'] <= lo) & (hot_df['Tt'] >= hi)]['mCp'].sum()
             h_q.append(h_q[-1] + mcp_sum * (hi - lo))
         
-        # Cold Composite (Shifted by Qh to show overlap)
+        # Cold Composite
         cold_df = edited_df[edited_df['Type'] == 'Cold'].copy()
         c_temps = sorted(pd.concat([cold_df['Ts'], cold_df['Tt']]).unique())
-        c_q = [qh]
+        c_q = [qh] # Start at Qh offset
         for i in range(len(c_temps)-1):
             lo, hi = c_temps[i], c_temps[i+1]
-            mcp_sum = cold_df[(cold_df['Ts'] <= lo) & (cold_df['Tt'] >= hi)]['mCp'].sum()
+            mcp_sum = cold_df[(cold_df['Ts'] <= lo) & (cold_df['Tt'] >= hi) | (cold_df['Ts'] >= hi) & (cold_df['Tt'] <= lo)]['mCp'].sum()
             c_q.append(c_q[-1] + mcp_sum * (hi - lo))
 
         fig_comp = go.Figure()
-        fig_comp.add_trace(go.Scatter(x=h_q, y=h_temps, name="Hot Composite", line=dict(color='red')))
-        fig_comp.add_trace(go.Scatter(x=c_q, y=c_temps, name="Cold Composite", line=dict(color='blue')))
-        fig_comp.update_layout(xaxis_title="Heat Load [kW]", yaxis_title="Temperature [°C]", height=400)
+        fig_comp.add_trace(go.Scatter(x=h_temps, y=h_q, name="Hot Composite", line=dict(color='red', width=3)))
+        fig_comp.add_trace(go.Scatter(x=c_temps, y=c_q, name="Cold Composite", line=dict(color='blue', width=3)))
+        fig_comp.update_layout(xaxis_title="Temperature [°C]", yaxis_title="Heat Load [kW]", height=450)
         st.plotly_chart(fig_comp, use_container_width=True)
 
     with g2:
         st.write("**Grand Composite Curve**")
-        fig_gcc = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="GCC", fill='tozerox', line=dict(color='green')))
-        fig_gcc.update_layout(xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temperature [°C]", height=400)
+        # Swap q_plot and t_plot to put Temp on X
+        fig_gcc = go.Figure(go.Scatter(x=t_plot, y=q_plot, mode='lines+markers', name="GCC", fill='tozeroy', line=dict(color='green')))
+        fig_gcc.update_layout(xaxis_title="Shifted Temperature [°C]", yaxis_title="Net Heat Flow [kW]", height=450)
         st.plotly_chart(fig_gcc, use_container_width=True)
 
     # --- SECTION 4: HEN MATCHING ---
