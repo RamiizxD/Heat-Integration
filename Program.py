@@ -15,22 +15,13 @@ This application performs **Pinch Analysis**, **MER Matching with Stream Splitti
 st.markdown("---")
 
 # --- CORE MATH FUNCTIONS ---
-def calculate_u(h1, h2):
-    return 1 / ((1/h1) + (1/h2))
-
-def lmtd_chen(t1, t2, t3, t4):
-    theta1 = max(abs(t1 - t4), 0.01)
-    theta2 = max(abs(t2 - t3), 0.01)
-    return (theta1 * theta2 * (theta1 + theta2) / 2)**(1/3)
-
 def run_thermal_logic(df, dt):
     df = df.copy()
     df[['mCp', 'Ts', 'Tt']] = df[['mCp', 'Ts', 'Tt']].apply(pd.to_numeric)
     
-    # --- FIXED INDENTATION HERE ---
-    # Shifting temperatures: Only Cold is shifted up by dt
-    df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'], df['Ts'] + dt)
-    df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
+    # Shifting temperatures
+    df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'] - dt/2, df['Ts'] + dt/2)
+    df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'] - dt/2, df['Tt'] + dt/2)
     
     temps = sorted(pd.concat([df['S_Ts'], df['S_Tt']]).unique(), reverse=True)
     intervals = []
@@ -44,10 +35,12 @@ def run_thermal_logic(df, dt):
     qh_min = abs(min(min(infeasible), 0))
     feasible = [qh_min + val for val in infeasible]
     pinch_t = temps[feasible.index(0)] if 0 in feasible else None
+    
     return qh_min, feasible[-1], pinch_t, temps, feasible, df
 
 def match_logic_with_splitting(df, pinch_t, side):
     sub = df.copy()
+    # Logic for matching based on shifted pinch
     if side == 'Above':
         sub['S_Ts'], sub['S_Tt'] = sub['S_Ts'].clip(lower=pinch_t), sub['S_Tt'].clip(lower=pinch_t)
     else:
@@ -64,6 +57,7 @@ def match_logic_with_splitting(df, pinch_t, side):
     
     while any(h['Q'] > 1 for h in hot) and any(c['Q'] > 1 for c in cold):
         h = next(s for s in hot if s['Q'] > 1)
+        # Simplified MER matching rule (mCp comparison)
         c = next((s for s in cold if (s['mCp'] >= h['mCp'] if side=='Above' else h['mCp'] >= s['mCp']) and s['Q'] > 1), None)
         
         is_split = False
@@ -99,7 +93,7 @@ if uploaded_file:
     except Exception as e: st.error(f"Error: {e}")
 
 if 'input_data' not in st.session_state:
-    st.session_state['input_data'] = pd.DataFrame(columns=["Stream", "Type", "mCp", "Ts", "Tt", "h"])
+    st.session_state['input_data'] = pd.DataFrame(columns=["Stream", "Type", "mCp", "Ts", "Tt"])
 
 with st.form("main_input_form"):
     dt_min_input = st.number_input("Target ΔTmin [°C]", min_value=1.0, value=10.0)
@@ -115,20 +109,53 @@ if st.session_state.get('run_clicked'):
     
     st.markdown("---")
     st.subheader("2. Pinch Analysis Result")
-    r1, r2 = st.columns([1, 2])
-    with r1:
-        st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
-        st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
-        # --- FIXED SYNTAX HERE ---
-        st.metric("Pinch Temperature (Hot)", f"{pinch} °C" if pinch is not None else "N/A")
-        st.metric("Pinch Temperature (Cold)", f"{pinch - dt_min_input} °C" if pinch is not None else "N/A")
-    with r2:
-        fig = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="Grand Composite Curve"))
-        fig.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]")
-        st.plotly_chart(fig, use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
+    c2.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
+    c3.metric("Pinch (Shifted)", f"{pinch} °C" if pinch is not None else "N/A")
 
+    # --- SECTION 3: GRAPHICAL REPRESENTATION ---
     st.markdown("---")
-    st.subheader("3. Heat Exchanger Network Matching (MER)")
+    st.subheader("3. Graphical Representation of Heat Loads")
+    
+    g1, g2 = st.columns(2)
+    
+    with g1:
+        st.write("**Composite Curves**")
+        # Logic to build Hot/Cold Composite Curves
+        # Hot Composite
+        hot_df = edited_df[edited_df['Type'] == 'Hot'].copy()
+        h_temps = sorted(pd.concat([hot_df['Ts'], hot_df['Tt']]).unique(), reverse=True)
+        h_q = [0]
+        for i in range(len(h_temps)-1):
+            hi, lo = h_temps[i], h_temps[i+1]
+            mcp_sum = hot_df[(hot_df['Ts'] >= hi) & (hot_df['Tt'] <= lo)]['mCp'].sum()
+            h_q.append(h_q[-1] + mcp_sum * (hi - lo))
+        
+        # Cold Composite (Shifted by Qh to show overlap)
+        cold_df = edited_df[edited_df['Type'] == 'Cold'].copy()
+        c_temps = sorted(pd.concat([cold_df['Ts'], cold_df['Tt']]).unique())
+        c_q = [qh]
+        for i in range(len(c_temps)-1):
+            lo, hi = c_temps[i], c_temps[i+1]
+            mcp_sum = cold_df[(cold_df['Ts'] <= lo) & (cold_df['Tt'] >= hi)]['mCp'].sum()
+            c_q.append(c_q[-1] + mcp_sum * (hi - lo))
+
+        fig_comp = go.Figure()
+        fig_comp.add_trace(go.Scatter(x=h_q, y=h_temps, name="Hot Composite", line=dict(color='red')))
+        fig_comp.add_trace(go.Scatter(x=c_q, y=c_temps, name="Cold Composite", line=dict(color='blue')))
+        fig_comp.update_layout(xaxis_title="Heat Load [kW]", yaxis_title="Temperature [°C]", height=400)
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+    with g2:
+        st.write("**Grand Composite Curve**")
+        fig_gcc = go.Figure(go.Scatter(x=q_plot, y=t_plot, mode='lines+markers', name="GCC", fill='tozerox', line=dict(color='green')))
+        fig_gcc.update_layout(xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temperature [°C]", height=400)
+        st.plotly_chart(fig_gcc, use_container_width=True)
+
+    # --- SECTION 4: HEN MATCHING ---
+    st.markdown("---")
+    st.subheader("4. Heat Exchanger Network Matching (MER)")
     
     match_summary = []
     if pinch is not None:
@@ -140,10 +167,7 @@ if st.session_state.get('run_clicked'):
                 st.write(f"**Matches {side} Pinch**")
                 if matches: 
                     m_df = pd.DataFrame(matches)
-                    def style_df(row):
-                        return ['background-color: #1e464a; color: #80cbc4' if row.Type == 'Split' else '' for _ in row]
-                    styled_html = m_df.style.apply(style_df, axis=1).to_html(escape=False, index=False)
-                    st.write(styled_html, unsafe_allow_html=True)
+                    st.dataframe(m_df, use_container_width=True, hide_index=True)
                 else: 
                     st.info("No internal matches possible.")
 
