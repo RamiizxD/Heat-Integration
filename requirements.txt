@@ -3,11 +3,3 @@ pandas
 numpy
 plotly
 openpyxl
-scipy
-pygad
-pyomo
-tabulate
-pydot
-
-# Install OUTDOOR from GitHub
-outdoor @ git+https://github.com/PKenkel/OUTDOOR.git
