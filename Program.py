@@ -12,49 +12,90 @@ st.markdown("---")
 
 # --- CORE MATH FUNCTIONS ---
 def run_thermal_logic(df, dt):
+    """
+    Standard Pinch Analysis (Problem Table) to find Energy Targets.
+    """
     df = df.copy()
     df[['mCp', 'Ts', 'Tt']] = df[['mCp', 'Ts', 'Tt']].apply(pd.to_numeric)
     
-    # SHIFT LOGIC: Hot stays same, Cold shifts UP by dTmin
-    df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'], df['Ts'] + dt)
-    df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'], df['Tt'] + dt)
+    # 1. Shift Temperatures (Hot - dt/2, Cold + dt/2)
+    df['S_Ts'] = np.where(df['Type'] == 'Hot', df['Ts'] - dt/2, df['Ts'] + dt/2)
+    df['S_Tt'] = np.where(df['Type'] == 'Hot', df['Tt'] - dt/2, df['Tt'] + dt/2)
     
     temps = sorted(pd.concat([df['S_Ts'], df['S_Tt']]).unique(), reverse=True)
     intervals = []
+    
+    # 2. Problem Table Cascade
     for i in range(len(temps)-1):
         hi, lo = temps[i], temps[i+1]
         h_mcp = df[(df['Type'] == 'Hot') & (df['S_Ts'] >= hi) & (df['S_Tt'] <= lo)]['mCp'].sum()
         c_mcp = df[(df['Type'] == 'Cold') & (df['S_Ts'] <= lo) & (df['S_Tt'] >= hi)]['mCp'].sum()
         intervals.append({'hi': hi, 'lo': lo, 'net': (h_mcp - c_mcp) * (hi - lo)})
     
-    infeasible = [0] + list(pd.DataFrame(intervals)['net'].cumsum())
-    qh_min = abs(min(min(infeasible), 0))
-    feasible = [qh_min + val for val in infeasible]
+    net_heat = pd.DataFrame(intervals)['net']
+    cascade = [0] + list(net_heat.cumsum())
     
-    pinch_shifted = temps[feasible.index(0)] if 0 in feasible else None
+    # 3. Calculate Minimum Utility
+    qh_min = abs(min(min(cascade), 0)) # Max deficit
+    qc_min = cascade[-1] + qh_min
     
-    return qh_min, feasible[-1], pinch_shifted, temps, feasible, df
+    feasible_cascade = [val + qh_min for val in cascade]
+    pinch_shifted = temps[feasible_cascade.index(0)] if 0 in feasible_cascade else None
+    
+    # GCC Data (Shifted Temp vs Net Heat)
+    return qh_min, qc_min, pinch_shifted, temps, feasible_cascade, df
 
-def match_logic_with_splitting(df, pinch_s, side, dt):
+def get_curve_points(df, stream_type, start_enthalpy=0):
+    """ Generates standard (Enthalpy, Temp) points for a Composite Curve """
+    subset = df[df['Type'] == stream_type].copy()
+    if subset.empty: return [], []
+    
+    # Sort Temperatures: Hot (High->Low), Cold (Low->High)
+    temps = sorted(pd.concat([subset['Ts'], subset['Tt']]).unique())
+    if stream_type == 'Hot': temps.reverse() # Descending for Hot
+    
+    H_points = [start_enthalpy]
+    T_points = [temps[0]]
+    current_H = start_enthalpy
+    
+    for i in range(len(temps)-1):
+        t_start, t_end = temps[i], temps[i+1]
+        
+        # Find active streams in this interval
+        if stream_type == 'Hot':
+            # Hot goes High to Low
+            active = subset[(subset['Ts'] >= t_start) & (subset['Tt'] <= t_end)]
+            delta_t = t_start - t_end
+        else:
+            # Cold goes Low to High
+            active = subset[(subset['Ts'] <= t_start) & (subset['Tt'] >= t_end)]
+            delta_t = t_end - t_start
+            
+        mcp = active['mCp'].sum()
+        delta_h = mcp * delta_t
+        current_H += delta_h
+        
+        T_points.append(t_end)
+        H_points.append(current_H)
+        
+    return np.array(H_points), np.array(T_points)
+
+def match_logic_with_splitting(df, pinch_s, side):
+    """ (Standard MER Matching Logic kept as requested) """
     sub = df.copy()
-    # Logic for matching based on the shifted pinch boundary
     if side == 'Above':
         sub['S_Ts'], sub['S_Tt'] = sub['S_Ts'].clip(lower=pinch_s), sub['S_Tt'].clip(lower=pinch_s)
     else:
         sub['S_Ts'], sub['S_Tt'] = sub['S_Ts'].clip(upper=pinch_s), sub['S_Tt'].clip(upper=pinch_s)
     
-    sub['Q_Total'] = sub['mCp'] * abs(sub['S_Ts'] - sub['S_Tt'])
-    total_duties = sub.set_index('Stream')['Q_Total'].to_dict()
-    
-    sub['Q'] = sub['Q_Total']
-    streams = sub[sub['Q'] > 0.1].to_dict('records')
+    sub['Q'] = sub['mCp'] * abs(sub['S_Ts'] - sub['S_Tt'])
+    streams = sub[sub['Q'] > 0.01].to_dict('records')
     hot = [s for s in streams if s['Type'] == 'Hot']
     cold = [s for s in streams if s['Type'] == 'Cold']
     matches = []
     
     while any(h['Q'] > 1 for h in hot) and any(c['Q'] > 1 for c in cold):
         h = next(s for s in hot if s['Q'] > 1)
-        # MER rules: Above Pinch (mCp_hot <= mCp_cold), Below Pinch (mCp_hot >= mCp_cold)
         c = next((s for s in cold if (s['mCp'] >= h['mCp'] if side=='Above' else h['mCp'] >= s['mCp']) and s['Q'] > 1), None)
         
         is_split = False
@@ -64,112 +105,115 @@ def match_logic_with_splitting(df, pinch_s, side, dt):
             
         if c:
             m_q = min(h['Q'], c['Q'])
-            h_ratio = m_q / total_duties[h['Stream']] if total_duties[h['Stream']] > 0 else 0
-            ratio_text = f"{round(h_ratio, 2)} " if h_ratio < 0.99 else ""
-            match_str = f"{ratio_text}Stream {h['Stream']} ↔ {c['Stream']}"
-            
+            matches.append({"Match": f"Stream {h['Stream']} ↔ {c['Stream']}", "Duty [kW]": round(m_q, 2)})
             h['Q'] -= m_q
             c['Q'] -= m_q
-            matches.append({"Match": match_str, "Duty [kW]": round(m_q, 2), "Type": "Split" if is_split else "Direct"})
-        else:
-            break
+        else: break
     return matches, hot, cold
 
 # --- SECTION 1: DATA INPUT ---
 st.subheader("1. Stream Data Input")
-uploaded_file = st.file_uploader("Import Stream Data from Excel (.xlsx)", type=["xlsx"])
-if uploaded_file:
-    try:
-        import_df = pd.read_excel(uploaded_file)
-        st.session_state['input_data'] = import_df
-        st.success("Data imported!")
-    except Exception as e: st.error(f"Error: {e}")
-
 if 'input_data' not in st.session_state:
-    st.session_state['input_data'] = pd.DataFrame(columns=["Stream", "Type", "mCp", "Ts", "Tt"])
+    st.session_state['input_data'] = pd.DataFrame([
+        [1, 'Hot', 2.0, 150, 60],
+        [2, 'Hot', 1.0, 90, 60],
+        [3, 'Cold', 3.0, 20, 125],
+        [4, 'Cold', 0.5, 25, 100]
+    ], columns=["Stream", "Type", "mCp", "Ts", "Tt"])
 
 with st.form("main_input_form"):
     dt_min_input = st.number_input("Target ΔTmin [°C]", min_value=1.0, value=10.0)
     edited_df = st.data_editor(st.session_state['input_data'], num_rows="dynamic", use_container_width=True)
     submit_thermal = st.form_submit_button("Run Thermal Analysis")
 
-if submit_thermal and not edited_df.empty:
-    st.session_state.run_clicked = True
+if submit_thermal: st.session_state.run_clicked = True
 
 # --- MAIN OUTPUT DISPLAY ---
 if st.session_state.get('run_clicked'):
-    qh, qc, pinch_s, t_plot, q_plot, processed_df = run_thermal_logic(edited_df, dt_min_input)
+    qh, qc, pinch_s, gcc_t, gcc_q, processed_df = run_thermal_logic(edited_df, dt_min_input)
     
     st.markdown("---")
     st.subheader("2. Pinch Analysis Result")
-    r1, r2 = st.columns([1, 2])
-    with r1:
-        st.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
-        st.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
-        p_hot = pinch_s
-        p_cold = pinch_s - dt_min_input if pinch_s is not None else None
-        st.metric("Pinch Temp (Hot)", f"{p_hot:.1f} °C" if p_hot else "N/A")
-        st.metric("Pinch Temp (Cold)", f"{p_cold:.1f} °C" if p_cold else "N/A")
-    with r2:
-        st.write("**Temperature Data (Actual vs Shifted)**")
-        st.dataframe(processed_df[['Stream', 'Type', 'Ts', 'Tt', 'S_Ts', 'S_Tt']], use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Hot Utility (Qh)", f"{qh:,.2f} kW")
+    c2.metric("Cold Utility (Qc)", f"{qc:,.2f} kW")
+    if pinch_s: c3.metric("Pinch Temp (Shifted)", f"{pinch_s:.1f}°C")
 
     # --- SECTION 3: GRAPHICAL REPRESENTATION ---
     st.markdown("---")
-    st.subheader("3. Graphical Representation of Heat Loads")
+    st.subheader("3. Graphical Representation")
+    
     g1, g2 = st.columns(2)
+    
     with g1:
-        st.write("**Composite Curves (Hot vs Shifted Cold)**")
-        # Build Actual Hot Curve
-        hot_df = edited_df[edited_df['Type'] == 'Hot'].copy()
-        h_t = sorted(pd.concat([hot_df['Ts'], hot_df['Tt']]).unique())
-        h_q_vals = [0]
-        for i in range(len(h_t)-1):
-            mcp_sum = hot_df[((hot_df['Ts'] >= h_t[i+1]) & (hot_df['Tt'] <= h_t[i])) | ((hot_df['Ts'] <= h_t[i]) & (hot_df['Tt'] >= h_t[i+1]))]['mCp'].sum()
-            h_q_vals.append(h_q_vals[-1] + mcp_sum * (h_t[i+1] - h_t[i]))
+        st.write("**Composite Curves (Adjusted)**")
         
-        # Build Shifted Cold Curve (Starting at Qh to align at Pinch)
-        cold_df = edited_df[edited_df['Type'] == 'Cold'].copy()
-        c_t_actual = sorted(pd.concat([cold_df['Ts'], cold_df['Tt']]).unique())
-        c_t_shifted = [t + dt_min_input for t in c_t_actual]
-        c_q_vals = [qh]
-        for i in range(len(c_t_actual)-1):
-            mcp_sum = cold_df[((cold_df['Ts'] <= c_t_actual[i]) & (cold_df['Tt'] >= c_t_actual[i+1])) | ((cold_df['Ts'] >= c_t_actual[i+1]) & (cold_df['Tt'] <= c_t_actual[i]))]['mCp'].sum()
-            c_q_vals.append(c_q_vals[-1] + mcp_sum * (c_t_actual[i+1] - c_t_actual[i]))
-
-        fig_comp = go.Figure()
-        fig_comp.add_trace(go.Scatter(x=h_t, y=h_q_vals, name="Hot (Actual)", line=dict(color='red', width=3)))
-        fig_comp.add_trace(go.Scatter(x=c_t_shifted, y=c_q_vals, name="Cold (Shifted)", line=dict(color='blue', dash='dash')))
-        fig_comp.update_layout(xaxis_title="Temperature [°C]", yaxis_title="Heat Load [kW]")
-        st.plotly_chart(fig_comp, use_container_width=True)
+        # 1. Get Standard Curves (Hot @ 0, Cold @ Qh)
+        h_h, h_t = get_curve_points(edited_df, 'Hot', 0)
+        c_h, c_t = get_curve_points(edited_df, 'Cold', qh)
+        
+        # 2. IMPLEMENT USER LOGIC: Find Max Vertical Distance
+        if len(h_h) > 0 and len(c_h) > 0:
+            # Create a common X-axis (Enthalpy) grid for comparison
+            # We look at the overlapping range of Enthalpy
+            min_h = max(h_h.min(), c_h.min())
+            max_h = min(h_h.max(), c_h.max())
+            
+            # Generate grid points (include original points that fall in range)
+            grid_h = sorted(list(set(
+                [x for x in h_h if min_h <= x <= max_h] + 
+                [x for x in c_h if min_h <= x <= max_h]
+            )))
+            
+            if grid_h:
+                # Interpolate Temperatures at these grid points
+                t_hot_interp = np.interp(grid_h, h_h, h_t)
+                t_cold_interp = np.interp(grid_h, c_h, c_t)
+                
+                # Check (y_hot - y_cold) -> (t_hot - t_cold)
+                diffs = t_hot_interp - t_cold_interp
+                
+                # Find MAX difference
+                max_diff = np.max(diffs)
+                
+                # Add Max Diff to Cold Curve Y-coordinates (Raise it up)
+                c_t_raised = c_t + max_diff
+                
+                st.caption(f"Cold Curve raised vertically by Max ΔT ({max_diff:.2f}°C) to separate curves.")
+                
+                fig_comp = go.Figure()
+                fig_comp.add_trace(go.Scatter(x=h_h, y=h_t, name="Hot Composite", line=dict(color='green', width=3)))
+                # Plotting ONLY the raised curve, not the original
+                fig_comp.add_trace(go.Scatter(x=c_h, y=c_t_raised, name="Cold Composite (Raised)", line=dict(color='black', width=3)))
+                
+                fig_comp.update_layout(xaxis_title="Enthalpy [kW]", yaxis_title="Temperature [°C]", height=500)
+                st.plotly_chart(fig_comp, use_container_width=True)
+            else:
+                st.warning("Curves do not overlap on Enthalpy axis.")
+        else:
+            st.warning("Insufficient data to plot curves.")
 
     with g2:
         st.write("**Grand Composite Curve**")
-        fig_gcc = go.Figure(go.Scatter(x=t_plot, y=q_plot, mode='lines+markers', name="GCC", fill='tozeroy', line=dict(color='green')))
-        fig_gcc.update_layout(xaxis_title="Shifted Temperature [°C]", yaxis_title="Net Heat Flow [kW]")
+        fig_gcc = go.Figure(go.Scatter(x=gcc_q, y=gcc_t, fill='tozerox', line=dict(color='green')))
+        fig_gcc.update_layout(xaxis_title="Net Heat Flow [kW]", yaxis_title="Shifted Temp [°C]", height=500)
         st.plotly_chart(fig_gcc, use_container_width=True)
 
     # --- SECTION 4: MATCHING ---
     st.markdown("---")
-    st.subheader("4. Heat Exchanger Network Matching (MER)")
+    st.subheader("4. HEN Matching")
     if pinch_s:
         l, r = st.columns(2)
         match_summary = []
         for i, side in enumerate(['Above', 'Below']):
-            matches, h_rem, c_rem = match_logic_with_splitting(processed_df, pinch_s, side, dt_min_input)
+            matches, h_rem, c_rem = match_logic_with_splitting(processed_df, pinch_s, side)
             match_summary.extend(matches)
             with (l if i == 0 else r):
                 st.write(f"**Matches {side} Pinch**")
-                if matches:
-                    st.dataframe(pd.DataFrame(matches), use_container_width=True, hide_index=True)
-                else: st.info("No internal matches possible.")
-                for c in c_rem: 
-                    if c['Q'] > 1: st.error(f"**Heater:** Stream {c['Stream']} ({c['Q']:,.1f} kW)")
-                for h in h_rem: 
-                    if h['Q'] > 1: st.info(f"**Cooler:** Stream {h['Stream']} ({h['Q']:,.1f} kW)")
-    
-    # Export
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame(match_summary).to_excel(writer, sheet_name='Matches', index=False)
-    st.download_button(label="📥 Download HEN Report", data=output.getvalue(), file_name="HEN_Design.xlsx")
+                if matches: st.dataframe(pd.DataFrame(matches), hide_index=True)
+                else: st.info("No matches found.")
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            pd.DataFrame(match_summary).to_excel(writer, sheet_name='Matches', index=False)
+        st.download_button("📥 Download HEN Design", output.getvalue(), "HEN.xlsx")
