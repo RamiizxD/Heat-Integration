@@ -39,12 +39,18 @@ def run_thermal_logic(df, dt):
         dT = hi - lo
         net = (h_mcp - c_mcp) * dT
 
+        hot_load = h_mcp * dT
+        cold_load = c_mcp * dT
+
         intervals.append({
+            "Interval": i + 1,
             "T_high (shifted)": hi,
             "T_low (shifted)": lo,
             "ΔT": dT,
             "Σ mCp_hot": h_mcp,
             "Σ mCp_cold": c_mcp,
+            "Hot Load": hot_load,
+            "Cold Load": cold_load,
             "Net heat in interval": net,
         })
 
@@ -194,45 +200,44 @@ if st.session_state.get("run_clicked"):
 
     # ✅ Change 2: Show heat cascade diagram and table
     st.markdown("---")
-    st.subheader("3. Heat Cascade (Diagram + Table)")
+    st.subheader("3. Heat Cascade (Boxes)")
 
-    c1, c2 = st.columns([1, 1])
+    # Build cascade + revised cascade tables (like your Excel boxes)
+    if not interval_df.empty:
+        box_df = interval_df[["Interval", "Hot Load", "Cold Load", "Net heat in interval"]].copy()
+        box_df.rename(
+            columns={
+                "Hot Load": "Hot Loads",
+                "Cold Load": "Cold Loads",
+                "Net heat in interval": "Residual heat from interval",
+            },
+            inplace=True,
+        )
 
-    with c1:
-        st.write("**Interval Table (Shifted)**")
-        if not interval_df.empty:
-            # Add cumulative (infeasible) and feasible columns for readability
-            interval_df_show = interval_df.copy()
-            interval_df_show["Cumulative (infeasible)"] = interval_df_show["Net heat in interval"].cumsum()
-            interval_df_show["Cumulative (feasible)"] = qh + interval_df_show["Cumulative (infeasible)"]
-            st.dataframe(interval_df_show, use_container_width=True, hide_index=True)
-        else:
-            st.info("Not enough temperature levels to build intervals.")
+        # Infeasible cascade residuals (starting at 0)
+        box_df["Residual heat from interval"] = box_df["Residual heat from interval"].cumsum()
 
-    with c2:
-        st.write("**Heat Cascade Diagram**")
-        if not cascade_points_df.empty:
-            # Sort for a proper top-to-bottom cascade plot
-            cp = cascade_points_df.dropna().sort_values("Shifted Temperature", ascending=False)
-            fig_cascade = go.Figure()
-            fig_cascade.add_trace(
-                go.Scatter(
-                    x=cp["Cascade Heat Flow"],
-                    y=cp["Shifted Temperature"],
-                    mode="lines+markers",
-                    line_shape="hv",
-                    name="Heat Cascade",
-                )
+        # Revised (feasible) cascade adds Qhmin to every residual
+        revised_df = box_df.copy()
+        revised_df["Residual heat from interval"] = revised_df["Residual heat from interval"] + qh
+
+        b1, b2 = st.columns(2)
+        with b1:
+            st.write("**CASCADE**")
+            st.dataframe(
+                box_df[["Hot Loads", "Interval", "Cold Loads", "Residual heat from interval"]],
+                use_container_width=True,
+                hide_index=True,
             )
-            if pinch_s is not None:
-                fig_cascade.add_hline(y=pinch_s, line_dash="dash", annotation_text="Pinch (shifted)")
-            fig_cascade.update_layout(
-                xaxis_title="Cascaded Heat [kW]",
-                yaxis_title="Shifted Temperature [°C]",
+        with b2:
+            st.write("**Revised Cascade**")
+            st.dataframe(
+                revised_df[["Hot Loads", "Interval", "Cold Loads", "Residual heat from interval"]],
+                use_container_width=True,
+                hide_index=True,
             )
-            st.plotly_chart(fig_cascade, use_container_width=True)
-        else:
-            st.info("Cascade points are not available.")
+    else:
+        st.info("Not enough temperature levels to build cascade intervals.")
 
     # --- SECTION 4: GRAPHICAL REPRESENTATION ---
     st.markdown("---")
