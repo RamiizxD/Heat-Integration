@@ -200,7 +200,7 @@ if st.session_state.get("run_clicked"):
 
     # ✅ Change 2: Show heat cascade diagram and table
     st.markdown("---")
-    st.subheader("3. Heat Cascade (Boxes)")
+    st.subheader("3. Cascade and Revised Cascade Tables")
 
     # Build cascade + revised cascade tables (like your Excel boxes)
     if not interval_df.empty:
@@ -331,3 +331,4 @@ if st.session_state.get("run_clicked"):
         data=output.getvalue(),
         file_name="HEN_Design.xlsx",
     )
+
